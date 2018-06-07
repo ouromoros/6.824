@@ -30,5 +30,26 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	//
 	// Your code here (Part III, Part IV).
 	//
+	var done sync.WaitGroup
+	for i != 0; i < ntasks; i++ {
+		done.Add(1)
+		go scheduleTask(DoTaskArgs{
+			JobName: jobName,
+			File: mapFiles[i],
+			Phase: phase,
+			TaskNumber: i,
+			NumOtherPhase: n_other
+			}, registerChan)
+	}
+	done.Wait()
 	fmt.Printf("Schedule: %v done\n", phase)
+}
+
+func scheduleTask(args DoTaskArgs, registerChan chan string, done sync.WaitGroup) {
+	for srv := range registerChan {
+		if call(srv, "Worker.DoTask", args, nil) {
+			break
+		}
+	}
+	done.Done()
 }
