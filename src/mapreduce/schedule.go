@@ -41,17 +41,19 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 			File: mapFiles[i],
 			Phase: phase,
 			TaskNumber: i,
-			NumOtherPhase: n_other }, registerChan, done)
+			NumOtherPhase: n_other }, &registerChan, &done)
 	}
 	done.Wait()
 	fmt.Printf("Schedule: %v done\n", phase)
 }
 
-func scheduleTask(args DoTaskArgs, registerChan chan string, done sync.WaitGroup) {
-	for srv := range registerChan {
+func scheduleTask(args DoTaskArgs, registerChan *chan string, done *sync.WaitGroup) {
+	var srv string
+	for srv = range *registerChan {
 		if call(srv, "Worker.DoTask", args, nil) {
 			break
 		}
 	}
 	done.Done()
+	*registerChan <- srv
 }
