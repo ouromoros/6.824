@@ -3,7 +3,7 @@ package mapreduce
 import (
 	"os"
 	"encoding/json"
-	"sort"
+	"io"
 )
 
 func doReduce(
@@ -50,9 +50,10 @@ func doReduce(
 	//
 	// Your code here (Part I).
 	//
-	var kvMap map[string][]string
+	var kvMap = make(map[string][]string)
 	for i := 0; i < nMap; i++ {
-		f := os.Open(reduceName(jobName, i, reduceTask))
+		f, err := os.Open(reduceName(jobName, i, reduceTask))
+		if err != nil { panic(err) }
 		dec := json.NewDecoder(f)
 		for {
 			var kv KeyValue
@@ -61,11 +62,12 @@ func doReduce(
 			kvMap[kv.Key] = append(kvMap[kv.Key], kv.Value)
 		}
 	}
-	out := os.Create(outFile)
+	out, err := os.Create(outFile)
+	if err != nil { panic(err) }
 	enc := json.NewEncoder(out)
 	for k, v := range kvMap {
 		s := reduceF(k, v)
-		enc.Encode({key, s})
+		enc.Encode(KeyValue{k, s})
 	}
 	out.Close()
 }
