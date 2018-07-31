@@ -37,11 +37,11 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	for i := 0; i < ntasks; i++ {
 		done.Add(1)
 		go scheduleTask(DoTaskArgs{
-			JobName: jobName,
-			File: mapFiles[i],
-			Phase: phase,
-			TaskNumber: i,
-			NumOtherPhase: n_other }, &registerChan, &done)
+			JobName:       jobName,
+			File:          mapFiles[i],
+			Phase:         phase,
+			TaskNumber:    i,
+			NumOtherPhase: n_other}, &registerChan, &done)
 	}
 	done.Wait()
 	fmt.Printf("Schedule: %v done\n", phase)
