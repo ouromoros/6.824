@@ -65,6 +65,7 @@ type Raft struct {
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
+	applyCh   chan ApplyMsg
 
 	// utils
 	currentStatus      status
@@ -170,6 +171,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		assert(rf.currentStatus == candidate)
 		rf.currentTerm = args.Term
 		rf.currentStatus = follower
+		rf.votedFor = -1
 		DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
 	}
 
@@ -179,14 +181,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	var match int
 	// delete conflicting entries...
-
-	// append entries...
+	for match = 0; match < len(rf.log)-args.PrevLogIndex-1; match++ {
+		if rf.log[args.PrevLogIndex+match+1].Term != args.Entries[match].Term {
+			rf.log = rf.log[:args.PrevLogIndex+match+1]
+			break
+		}
+	}
+	// append entries... might have matched all
+	if match < len(args.Entries) {
+		rf.log = append(rf.log, args.Entries[match:]...)
+	}
 
 	// update commit
 	if args.LeaderCommit > rf.commitIndex {
 		lastIndex := len(rf.log) - 1
 		rf.commitIndex = min(lastIndex, args.LeaderCommit)
+		go rf.tryApply()
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -315,7 +327,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.currentTerm
 		index = len(rf.log)
 		isLeader = true
-		rf.log = append(rf.log, Log{ command, rf.currentTerm })
+		rf.log = append(rf.log, Log{command, rf.currentTerm})
 	} else {
 		isLeader = false
 	}
@@ -349,6 +361,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
+	rf.applyCh = applyCh
 	rf.me = me
 	rf.currentTerm = 1
 	rf.currentStatus = follower
@@ -389,7 +402,7 @@ func (rf *Raft) appendEntries() {
 		if i != rf.me {
 			server := i
 			prevLogIndex := rf.nextIndex[server] - 1
-			var entries []Log
+			entries := rf.log[rf.nextIndex[server]:]
 			args := AppendEntriesArgs{
 				Term:         thisTerm,
 				LeaderId:     rf.me,
@@ -415,13 +428,29 @@ func (rf *Raft) appendEntries() {
 				if reply.Success {
 					rf.matchIndex[server] = max(rf.nextIndex[server]+len(entries)-1, rf.matchIndex[server])
 					rf.nextIndex[server] = max(rf.nextIndex[server]+len(entries), rf.nextIndex[server])
+					for index := rf.commitIndex + 1; index < len(rf.log); index++ {
+						matchCount := 1
+						for i := 0; i < len(rf.peers); i++ {
+							if i != rf.me && rf.matchIndex[i] >= index {
+								matchCount++
+							}
+						}
+						if matchCount > len(rf.peers)/2 {
+							rf.commitIndex++
+						} else {
+							break
+						}
+					}
+					go rf.tryApply()
 				} else {
 					if thisTerm < reply.Term {
 						rf.currentTerm = reply.Term
 						rf.currentStatus = follower
+						rf.votedFor = -1
 						DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
 					} else {
 						// append fail, decrease
+						rf.nextIndex[server]--
 					}
 				}
 			}()
@@ -432,17 +461,18 @@ func (rf *Raft) appendEntries() {
 
 func (rf *Raft) detectTimeOut() {
 	for {
-		time.Sleep(time.Duration(50) * time.Millisecond)
+		time.Sleep(time.Duration(10) * time.Millisecond)
 		rf.mu.Lock()
 		diffTime := time.Now().Sub(rf.lastTimeFromLeader)
 		followerTimeOut := time.Duration(rand.Intn(100)+200) * time.Millisecond
-		candidateTimeOut := time.Duration(rand.Intn(100)+400) * time.Millisecond
+		candidateTimeOut := time.Duration(rand.Intn(200)+400) * time.Millisecond
 		if (rf.currentStatus == follower && diffTime > followerTimeOut) ||
 			(rf.currentStatus == candidate && diffTime > candidateTimeOut) {
 			rf.currentStatus = candidate
-			DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
 			rf.currentTerm++
 			rf.votedFor = rf.me
+			rf.lastTimeFromLeader = time.Now()
+			DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
 			rf.requestVotes()
 		}
 		rf.mu.Unlock()
@@ -491,5 +521,18 @@ func (rf *Raft) requestVotes() {
 			}()
 		}
 	}
-	rf.lastTimeFromLeader = time.Now()
+}
+
+func (rf *Raft) tryApply() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: true,
+			CommandIndex: i,
+			Command:      rf.log[i].Command,
+		}
+	}
+	rf.lastApplied = rf.commitIndex
 }
