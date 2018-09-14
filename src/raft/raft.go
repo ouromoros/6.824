@@ -65,6 +65,7 @@ const (
 //
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	applyCond sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -72,7 +73,8 @@ type Raft struct {
 
 	// utils
 	currentStatus      status
-	lastTimeFromLeader time.Time
+	timeOutSeqNum int
+	// lastTimeFromLeader time.Time
 	// persistent
 	currentTerm int
 	log         []Log
@@ -179,22 +181,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.lastTimeFromLeader = time.Now()
+	// rf.lastTimeFromLeader = time.Now()
+	go rf.updateAndSetTimeout()
 
 	if rf.currentTerm < args.Term {
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
-		rf.currentStatus = follower
-		rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+		rf.turnFollower(args.Term)
 	}
 
 	if rf.currentStatus != follower {
 		assert(rf.currentTerm == args.Term)
 		assert(rf.currentStatus == candidate)
-		rf.currentTerm = args.Term
-		rf.currentStatus = follower
-		rf.votedFor = -1
-		rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+		rf.turnFollower(args.Term)
 	}
 
 	if len(rf.log) <= args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -225,7 +222,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		lastIndex := len(rf.log) - 1
 		rf.commitIndex = min(lastIndex, args.LeaderCommit)
-		go rf.tryApply()
+		// go rf.tryApply()
+		rf.applyCond.Signal()
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -274,10 +272,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if rf.currentTerm < args.Term {
-		rf.votedFor = -1
-		rf.currentTerm = args.Term
-		rf.currentStatus = follower
-		rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+		rf.turnFollower(args.Term)
 	}
 
 	lastLogIndex := len(rf.log) - 1
@@ -286,7 +281,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(lastLogTerm < args.LastLogTerm ||
 			(lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex)) {
-		rf.lastTimeFromLeader = time.Now()
+		// rf.lastTimeFromLeader = time.Now()
+		go rf.updateAndSetTimeout()
 		rf.votedFor = args.CandidateId
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
@@ -404,9 +400,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.currentTerm = 1
 	rf.currentStatus = follower
-	rf.lastTimeFromLeader = time.Now().Add(time.Duration(-900) * time.Millisecond)
+	// rf.lastTimeFromLeader = time.Now().Add(time.Duration(-900) * time.Millisecond)
 	rf.log = make([]Log, 1)
 	rf.commitIndex = 0
+
+	rf.applyCond = rf.NewCond(&rf.mu)
 	rf.Debug = 0
 
 	// Your initialization code here (2A, 2B, 2C).
@@ -417,22 +415,23 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 
 	go rf.run()
+	go rf.updateAndSetTimeout()
 
 	return rf
 }
 
 func (rf *Raft) run() {
-	go rf.sendHeartBeats()
-	go rf.detectTimeOut()
+	go rf.sendHeartBeatsThread()
+	go rf.tryApplyThread()
+	// go rf.detectTimeOut()
 }
 
-func (rf *Raft) sendHeartBeats() {
+func (rf *Raft) sendHeartBeatsThread() {
 	for {
-		time.Sleep(time.Duration(10) * time.Millisecond)
+		time.Sleep(time.Duration(100) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.currentStatus == leader {
 			rf.appendEntries()
-			time.Sleep(time.Duration(120) * time.Millisecond)
 		}
 		rf.mu.Unlock()
 	}
@@ -474,10 +473,7 @@ func (rf *Raft) appendEntries() {
 				defer rf.mu.Unlock()
 				defer rf.persist()
 				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.currentStatus = follower
-					rf.votedFor = -1
-					rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+					rf.turnFollower(reply.Term)
 					return
 				}
 				if rf.currentTerm != thisTerm {
@@ -502,13 +498,11 @@ func (rf *Raft) appendEntries() {
 						}
 					}
 					rf.DPrintf("Server %d: client %d success on %d", rf.me, server, thisMatchIndex + len(entries))
-					go rf.tryApply()
+					// go rf.tryApply()
+					rf.applyCond.Signal()
 				} else {
 					if thisTerm < reply.Term {
-						rf.currentTerm = reply.Term
-						rf.currentStatus = follower
-						rf.votedFor = -1
-						rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+						rf.turnFollower(reply.Term)
 					} else {
 
 						if rf.nextIndex[server] != thisNextIndex || rf.matchIndex[server] != thisMatchIndex {
@@ -534,25 +528,68 @@ func (rf *Raft) appendEntries() {
 	}
 }
 
-func (rf *Raft) detectTimeOut() {
-	rand.Seed(int64(time.Now().Nanosecond()))
+// func (rf *Raft) detectTimeOut() {
+// 	rand.Seed(int64(time.Now().Nanosecond()))
+// 	timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
+// 	for {
+// 		time.Sleep(time.Duration(10) * time.Millisecond)
+// 		rf.mu.Lock()
+// 		diffTime :=  time.Now().Sub(rf.lastTimeFromLeader)
+// 		if rf.currentStatus != leader && diffTime > timeOut {
+// 			timeOut = time.Duration(rand.Intn(1000)+1000) * time.Millisecond
+// 			rf.currentStatus = candidate
+// 			rf.currentTerm++
+// 			rf.votedFor = rf.me
+// 			rf.lastTimeFromLeader = time.Now()
+// 			rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
+// 			rf.requestVotes()
+// 		}
+// 		rf.persist()
+// 		rf.mu.Unlock()
+// 	}
+// }
+
+func (rf *Raft) updateAndSetTimeout() {
 	timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
-	for {
-		time.Sleep(time.Duration(10) * time.Millisecond)
-		rf.mu.Lock()
-		diffTime :=  time.Now().Sub(rf.lastTimeFromLeader)
-		if rf.currentStatus != leader && diffTime > timeOut {
-			timeOut = time.Duration(rand.Intn(1000)+1000) * time.Millisecond
-			rf.currentStatus = candidate
-			rf.currentTerm++
-			rf.votedFor = rf.me
-			rf.lastTimeFromLeader = time.Now()
-			rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
-			rf.requestVotes()
-		}
-		rf.persist()
-		rf.mu.Unlock()
+	rf.mu.Lock()
+	seq := ++rf.timeOutSeqNum
+	rf.mu.Unlock()
+
+	time.Sleep(timeOut)
+
+	rf.mu.Lock()
+	if rf.status != leader && rf.timeOutSeqNum == seq {
+		rf.turnCandidate()
 	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) turnCandidate() {
+	rf.currentStatus = candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	// rf.lastTimeFromLeader = time.Now()
+	rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
+	rf.requestVotes()	
+	go rf.updateAndSetTimeout()
+}
+
+func (rf *Raft) turnFollower(term int) {
+	rf.currentTerm = term
+	rf.currentStatus = follower
+	rf.votedFor = -1
+	rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+}
+
+func (rf *Raft) turnLeader() {
+	rf.DPrintf("Server %d has become leader on Term %d", rf.me, rf.currentTerm) rf.currentStatus = leader
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = len(rf.log)
+	}
+	rf.appendEntries()
 }
 
 func (rf *Raft) requestVotes() {
@@ -581,10 +618,7 @@ func (rf *Raft) requestVotes() {
 				defer rf.mu.Unlock()
 				defer rf.persist()
 				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.currentStatus = follower
-					rf.votedFor = -1
-					rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+					rf.turnFollower(reply.Term)
 				}
 				if rf.currentStatus != candidate || rf.currentTerm != thisTerm {
 					return
@@ -594,31 +628,38 @@ func (rf *Raft) requestVotes() {
 					voteCount++
 				}
 				if voteCount > len(rf.peers)/2 {
-					rf.DPrintf("Server %d has become leader on Term %d", rf.me, rf.currentTerm)
-					rf.currentStatus = leader
-					rf.matchIndex = make([]int, len(rf.peers))
-					rf.nextIndex = make([]int, len(rf.peers))
-					for i := 0; i < len(rf.peers); i++ {
-						rf.matchIndex[i] = 0
-						rf.nextIndex[i] = len(rf.log)
-					}
-					rf.appendEntries()
+					turnLeader()
 				}
 			}()
 		}
 	}
 }
 
-func (rf *Raft) tryApply() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			CommandIndex: i,
-			Command:      rf.log[i].Command,
+func (rf *Raft) tryApplyThread() {
+	for {
+		rf.applyCond.L.Lock()
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				CommandIndex: i,
+				Command:      rf.log[i].Command,
+			}
 		}
+		rf.lastApplied = rf.commitIndex
+		rf.applyCond.Wait()
 	}
-	rf.lastApplied = rf.commitIndex
 }
+
+// func (rf *Raft) tryApply() {
+// 	rf.mu.Lock()
+// 	defer rf.mu.Unlock()
+
+// 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+// 		rf.applyCh <- ApplyMsg{
+// 			CommandValid: true,
+// 			CommandIndex: i,
+// 			Command:      rf.log[i].Command,
+// 		}
+// 	}
+// 	rf.lastApplied = rf.commitIndex
+// }
