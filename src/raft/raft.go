@@ -84,7 +84,8 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	Debug int
+	debug int
+	killed bool
 }
 
 // return currentTerm and whether this server
@@ -373,12 +374,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	rf.mu.Lock()
-	rf.Debug = 0
+	rf.debug = 0
 	rf.mu.Unlock()
 }
 
 func (rf *Raft) DPrintf(format string, a ...interface{}) (n int, err error) {
-	if rf.Debug > 0 {
+	if rf.debug > 0 {
 		log.Printf(format, a...)
 	}
 	return
@@ -407,7 +408,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastTimeFromLeader = time.Now().Add(time.Duration(-900) * time.Millisecond)
 	rf.log = make([]Log, 1)
 	rf.commitIndex = 0
-	rf.Debug = 0
+
+	rf.killed = false
+	rf.debug = Debug
 
 	// Your initialization code here (2A, 2B, 2C).
 	// Watch for timeout here. If timeout, start a another term
@@ -428,6 +431,7 @@ func (rf *Raft) run() {
 
 func (rf *Raft) sendHeartBeats() {
 	for {
+		if rf.killed { break }
 		time.Sleep(time.Duration(10) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.currentStatus == leader {
@@ -472,7 +476,6 @@ func (rf *Raft) appendEntries() {
 
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				defer rf.persist()
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.currentStatus = follower
@@ -510,13 +513,9 @@ func (rf *Raft) appendEntries() {
 						rf.votedFor = -1
 						rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
 					} else {
-
 						if rf.nextIndex[server] != thisNextIndex || rf.matchIndex[server] != thisMatchIndex {
 							return
 						}
-						// if reply.FailTerm == args.PrevLogTerm {
-						// 	reply.FailTerm--
-						// }
 						if reply.FailTerm < args.PrevLogTerm {
 							for rf.log[rf.nextIndex[server] - 1].Term > reply.FailTerm {
 								rf.nextIndex[server]--
@@ -525,6 +524,7 @@ func (rf *Raft) appendEntries() {
 							rf.nextIndex[server] = min(rf.nextIndex[server], prevLogIndex)
 						}
 						rf.DPrintf("Server %d: client %d fail on %d", rf.me, server, prevLogIndex)
+						rf.appendEntries()
 						assert(rf.nextIndex[server] > 0)
 					}
 				}
@@ -538,6 +538,7 @@ func (rf *Raft) detectTimeOut() {
 	rand.Seed(int64(time.Now().Nanosecond()))
 	timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
 	for {
+		if rf.killed { break }
 		time.Sleep(time.Duration(10) * time.Millisecond)
 		rf.mu.Lock()
 		diffTime :=  time.Now().Sub(rf.lastTimeFromLeader)
@@ -550,7 +551,7 @@ func (rf *Raft) detectTimeOut() {
 			rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
 			rf.requestVotes()
 		}
-		rf.persist()
+		// rf.persist()
 		rf.mu.Unlock()
 	}
 }
@@ -579,7 +580,7 @@ func (rf *Raft) requestVotes() {
 
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				defer rf.persist()
+				// defer rf.persist()
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.currentStatus = follower
