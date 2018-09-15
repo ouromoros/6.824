@@ -21,10 +21,10 @@ import (
 	"bytes"
 	"labgob"
 	"labrpc"
+	"log"
 	"math/rand"
 	"sync"
 	"time"
-	"log"
 )
 
 // import "bytes"
@@ -65,15 +65,15 @@ const (
 //
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	applyCond sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	applyCh   chan ApplyMsg
 
 	// utils
-	currentStatus      status
+	currentStatus status
 	timeOutSeqNum int
+	wakeApplyCh   chan struct{}
 	// lastTimeFromLeader time.Time
 	// persistent
 	currentTerm int
@@ -86,7 +86,7 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	debug int
+	debug  int
 	killed bool
 }
 
@@ -223,15 +223,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		lastIndex := len(rf.log) - 1
 		rf.commitIndex = min(lastIndex, args.LeaderCommit)
-		// go rf.tryApply()
-		rf.applyCond.Signal()
+		rf.tryWakeApply()
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// DPrintf("Server %d sending append", rf.me)
+	// rf.DPrintf("Server %d sending ap to %d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -323,6 +322,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	// rf.DPrintf("Server %d sending rv to %d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -404,10 +404,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// rf.lastTimeFromLeader = time.Now().Add(time.Duration(-900) * time.Millisecond)
 	rf.log = make([]Log, 1)
 	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.wakeApplyCh = make(chan struct{}, 1)
 
 	rf.killed = false
 	rf.debug = Debug
-	rf.applyCond = *sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 	// Watch for timeout here. If timeout, start a another term
@@ -416,8 +417,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	go rf.run()
-	go rf.updateAndSetTimeout()
+	rf.run()
 
 	return rf
 }
@@ -425,12 +425,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) run() {
 	go rf.sendHeartBeatsThread()
 	go rf.tryApplyThread()
+	go rf.updateAndSetTimeout()
 	// go rf.detectTimeOut()
 }
 
 func (rf *Raft) sendHeartBeatsThread() {
 	for {
-		if rf.killed { break }
+		if rf.killed {
+			break
+		}
 		time.Sleep(time.Duration(100) * time.Millisecond)
 		rf.mu.Lock()
 		if rf.currentStatus == leader {
@@ -494,14 +497,14 @@ func (rf *Raft) appendEntries() {
 							}
 							if matchCount > len(rf.peers)/2 {
 								rf.commitIndex = index
+								rf.DPrintf("Server %d: commit index updated to %d", rf.me, rf.commitIndex)
 							} else {
 								break
 							}
 						}
 					}
-					rf.DPrintf("Server %d: client %d success on %d", rf.me, server, thisMatchIndex + len(entries))
-					// go rf.tryApply()
-					rf.applyCond.Signal()
+					// rf.DPrintf("Server %d: client %d success on %d", rf.me, server, thisMatchIndex+len(entries))
+					rf.tryWakeApply()
 				} else {
 					if thisTerm < reply.Term {
 						rf.turnFollower(reply.Term)
@@ -510,7 +513,7 @@ func (rf *Raft) appendEntries() {
 							return
 						}
 						if reply.FailTerm < args.PrevLogTerm {
-							for rf.log[rf.nextIndex[server] - 1].Term > reply.FailTerm {
+							for rf.log[rf.nextIndex[server]-1].Term > reply.FailTerm {
 								rf.nextIndex[server]--
 							}
 						} else {
@@ -565,20 +568,20 @@ func (rf *Raft) updateAndSetTimeout() {
 }
 
 func (rf *Raft) turnCandidate() {
+	rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
 	rf.currentStatus = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	// rf.lastTimeFromLeader = time.Now()
-	rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
-	rf.requestVotes()	
 	go rf.updateAndSetTimeout()
+	rf.requestVotes()
 }
 
 func (rf *Raft) turnFollower(term int) {
-	rf.currentTerm = term
-	rf.currentStatus = follower
-	rf.votedFor = -1
 	rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+	rf.currentStatus = follower
+	rf.currentTerm = term
+	rf.votedFor = -1
 }
 
 func (rf *Raft) turnLeader() {
@@ -611,7 +614,7 @@ func (rf *Raft) requestVotes() {
 				var reply RequestVoteReply
 				ok := rf.sendRequestVote(server, &args, &reply)
 				if !ok {
-					// rf.DPrintf("Server %d send rv fail!", rf.me)
+					rf.DPrintf("Server %d send rv fail!", rf.me)
 					return
 				}
 
@@ -638,16 +641,26 @@ func (rf *Raft) requestVotes() {
 
 func (rf *Raft) tryApplyThread() {
 	for {
-		rf.applyCond.L.Lock()
+		if rf.killed { break }
+		rf.mu.Lock()
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				CommandIndex: i,
 				Command:      rf.log[i].Command,
 			}
+			// rf.DPrintf("Server %d: applied %d", rf.me, i)
 		}
 		rf.lastApplied = rf.commitIndex
-		rf.applyCond.Wait()
+		rf.mu.Unlock()
+		<-rf.wakeApplyCh
+	}
+}
+
+func (rf *Raft) tryWakeApply() {
+	select {
+	case rf.wakeApplyCh <- struct{}{}:
+	default:
 	}
 }
 
