@@ -72,8 +72,9 @@ type Raft struct {
 
 	// utils
 	currentStatus status
-	timeOutSeqNum int
+	// timeOutSeqNum int
 	wakeApplyCh   chan struct{}
+	updateTimeoutCh chan struct{}
 	// lastTimeFromLeader time.Time
 	// persistent
 	currentTerm int
@@ -183,7 +184,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// rf.lastTimeFromLeader = time.Now()
-	go rf.updateAndSetTimeout()
+	// go rf.updateAndSetTimeout()
+	rf.updateTimeout()
 
 	if rf.currentTerm < args.Term {
 		rf.turnFollower(args.Term)
@@ -282,7 +284,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(lastLogTerm < args.LastLogTerm ||
 			(lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex)) {
 		// rf.lastTimeFromLeader = time.Now()
-		go rf.updateAndSetTimeout()
+		// go rf.updateAndSetTimeout()
+		rf.updateTimeout()
 		rf.votedFor = args.CandidateId
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
@@ -406,6 +409,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.wakeApplyCh = make(chan struct{}, 1)
+	rf.updateTimeoutCh = make(chan struct{}, 1)
 
 	rf.killed = false
 	rf.debug = Debug
@@ -425,7 +429,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) run() {
 	go rf.sendHeartBeatsThread()
 	go rf.tryApplyThread()
-	go rf.updateAndSetTimeout()
+	go rf.detectTimeOutThread()
+	// go rf.updateAndSetTimeout()
 	// go rf.detectTimeOut()
 }
 
@@ -551,20 +556,42 @@ func (rf *Raft) appendEntries() {
 // 	}
 // }
 
-func (rf *Raft) updateAndSetTimeout() {
-	timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
-	rf.mu.Lock()
-	rf.timeOutSeqNum++
-	seq := rf.timeOutSeqNum
-	rf.mu.Unlock()
+// func (rf *Raft) updateAndSetTimeout() {
+// 	timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
+// 	rf.mu.Lock()
+// 	rf.timeOutSeqNum++
+// 	seq := rf.timeOutSeqNum
+// 	rf.mu.Unlock()
 
-	time.Sleep(timeOut)
+// 	time.Sleep(timeOut)
 
-	rf.mu.Lock()
-	if rf.currentStatus != leader && rf.timeOutSeqNum == seq {
-		rf.turnCandidate()
+// 	rf.mu.Lock()
+// 	if rf.currentStatus != leader && rf.timeOutSeqNum == seq {
+// 		rf.turnCandidate()
+// 	}
+// 	rf.mu.Unlock()
+// }
+
+func (rf *Raft) detectTimeOutThread() {
+	for {
+		timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
+		select {
+		case <-time.After(timeOut):
+			rf.mu.Lock()
+			if rf.currentStatus != leader {
+				rf.turnCandidate()
+			}
+			rf.mu.Unlock()
+		case <-rf.updateTimeoutCh:
+		}
 	}
-	rf.mu.Unlock()
+}
+
+func (rf *Raft) updateTimeout() {
+	select {
+	case rf.updateTimeoutCh <- struct{}{}:
+	default:
+	}
 }
 
 func (rf *Raft) turnCandidate() {
@@ -573,7 +600,8 @@ func (rf *Raft) turnCandidate() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	// rf.lastTimeFromLeader = time.Now()
-	go rf.updateAndSetTimeout()
+	// go rf.updateAndSetTimeout()
+	rf.updateTimeout();
 	rf.requestVotes()
 }
 
