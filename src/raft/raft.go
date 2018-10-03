@@ -27,9 +27,6 @@ import (
 	"time"
 )
 
-// import "bytes"
-// import "labgob"
-
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -71,11 +68,9 @@ type Raft struct {
 	applyCh   chan ApplyMsg
 
 	// utils
-	currentStatus status
-	// timeOutSeqNum int
-	wakeApplyCh   chan struct{}
+	currentStatus   status
+	wakeApplyCh     chan struct{}
 	updateTimeoutCh chan struct{}
-	// lastTimeFromLeader time.Time
 	// persistent
 	currentTerm int
 	log         []Log
@@ -105,14 +100,6 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -128,19 +115,6 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -183,8 +157,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// rf.lastTimeFromLeader = time.Now()
-	// go rf.updateAndSetTimeout()
 	rf.updateTimeout()
 
 	if rf.currentTerm < args.Term {
@@ -283,8 +255,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
 		(lastLogTerm < args.LastLogTerm ||
 			(lastLogTerm == args.LastLogTerm && lastLogIndex <= args.LastLogIndex)) {
-		// rf.lastTimeFromLeader = time.Now()
-		// go rf.updateAndSetTimeout()
 		rf.updateTimeout()
 		rf.votedFor = args.CandidateId
 		reply.Term = rf.currentTerm
@@ -371,7 +341,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // turn off debug output from this instance.
 //
 func (rf *Raft) Kill() {
-	// Your code here, if desired.
 	rf.mu.Lock()
 	rf.debug = 0
 	rf.mu.Unlock()
@@ -430,8 +399,6 @@ func (rf *Raft) run() {
 	go rf.sendHeartBeatsThread()
 	go rf.tryApplyThread()
 	go rf.detectTimeOutThread()
-	// go rf.updateAndSetTimeout()
-	// go rf.detectTimeOut()
 }
 
 func (rf *Raft) sendHeartBeatsThread() {
@@ -535,45 +502,11 @@ func (rf *Raft) appendEntries() {
 	}
 }
 
-// func (rf *Raft) detectTimeOut() {
-// 	rand.Seed(int64(time.Now().Nanosecond()))
-// 	timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
-// 	for {
-// 		time.Sleep(time.Duration(10) * time.Millisecond)
-// 		rf.mu.Lock()
-// 		diffTime :=  time.Now().Sub(rf.lastTimeFromLeader)
-// 		if rf.currentStatus != leader && diffTime > timeOut {
-// 			timeOut = time.Duration(rand.Intn(1000)+1000) * time.Millisecond
-// 			rf.currentStatus = candidate
-// 			rf.currentTerm++
-// 			rf.votedFor = rf.me
-// 			rf.lastTimeFromLeader = time.Now()
-// 			rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
-// 			rf.requestVotes()
-// 		}
-// 		rf.persist()
-// 		rf.mu.Unlock()
-// 	}
-// }
-
-// func (rf *Raft) updateAndSetTimeout() {
-// 	timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
-// 	rf.mu.Lock()
-// 	rf.timeOutSeqNum++
-// 	seq := rf.timeOutSeqNum
-// 	rf.mu.Unlock()
-
-// 	time.Sleep(timeOut)
-
-// 	rf.mu.Lock()
-// 	if rf.currentStatus != leader && rf.timeOutSeqNum == seq {
-// 		rf.turnCandidate()
-// 	}
-// 	rf.mu.Unlock()
-// }
-
 func (rf *Raft) detectTimeOutThread() {
 	for {
+		if rf.killed {
+			break
+		}
 		timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
 		select {
 		case <-time.After(timeOut):
@@ -599,9 +532,7 @@ func (rf *Raft) turnCandidate() {
 	rf.currentStatus = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	// rf.lastTimeFromLeader = time.Now()
-	// go rf.updateAndSetTimeout()
-	rf.updateTimeout();
+	rf.updateTimeout()
 	rf.requestVotes()
 }
 
@@ -669,7 +600,9 @@ func (rf *Raft) requestVotes() {
 
 func (rf *Raft) tryApplyThread() {
 	for {
-		if rf.killed { break }
+		if rf.killed {
+			break
+		}
 		rf.mu.Lock()
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			rf.applyCh <- ApplyMsg{
@@ -691,17 +624,3 @@ func (rf *Raft) tryWakeApply() {
 	default:
 	}
 }
-
-// func (rf *Raft) tryApply() {
-// 	rf.mu.Lock()
-// 	defer rf.mu.Unlock()
-
-// 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-// 		rf.applyCh <- ApplyMsg{
-// 			CommandValid: true,
-// 			CommandIndex: i,
-// 			Command:      rf.log[i].Command,
-// 		}
-// 	}
-// 	rf.lastApplied = rf.commitIndex
-// }
