@@ -603,17 +603,15 @@ func (rf *Raft) tryApplyThread() {
 		if rf.killed {
 			break
 		}
-		rf.mu.Lock()
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+		thisCommitIndex := rf.commitIndex
+		for i := rf.lastApplied + 1; i <= thisCommitIndex; i++ {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				CommandIndex: i,
 				Command:      rf.log[i].Command,
 			}
-			// rf.DPrintf("Server %d: applied %d", rf.me, i)
 		}
-		rf.lastApplied = rf.commitIndex
-		rf.mu.Unlock()
+		rf.lastApplied = thisCommitIndex
 		<-rf.wakeApplyCh
 	}
 }
