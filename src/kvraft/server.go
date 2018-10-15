@@ -37,20 +37,34 @@ type KVServer struct {
 
 	// Your definitions here.
 	registerApply map[int]chan raft.ApplyMsg
-	killed bool
+	killed        bool
 
 	data map[string]string
-
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
 	kv.mu.Lock()
 	op := Op{
-		Type:  "Get",
-		Key:   args.Key,
-		Value: "",
+		Type:       "Get",
+		Key:        args.Key,
+		Identifier: args.Identifier,
+		Value:      "",
 	}
+
+	log := kv.rf.GetLog()
+	if args.PrevIndex < len(log) {
+		for i, l := range log[args.PrevIndex:] {
+			if l.Command.(Op) == op {
+				DPrintf("Found duplicate on Get")
+				reply.WrongLeader = false
+				reply.Value = kv.data[op.Key]
+				reply.Index = args.PrevIndex + i
+				kv.mu.Unlock()
+				return
+			}
+		}
+	}
+
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
@@ -59,7 +73,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	DPrintf("Server %d started Get on %d", kv.me, index)
+	_, prs := kv.registerApply[index]
+	if prs {
+		kv.registerApply[index] <- raft.ApplyMsg{
+			CommandValid: false,
+		}
+		close(kv.registerApply[index])
+	}
 
 	ch := make(chan raft.ApplyMsg)
 	kv.registerApply[index] = ch
@@ -71,16 +91,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.WrongLeader = false
 		kv.mu.Lock()
 		reply.Value = kv.data[op.Key]
+		reply.Index = index - 1
 		kv.mu.Unlock()
 	} else {
 		reply.WrongLeader = true
 		reply.Err = "Leader Change"
 	}
-	DPrintf("Server %d finished Get", kv.me)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
 	kv.mu.Lock()
 	op := Op{
 		Type:       args.Op,
@@ -88,6 +107,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Value:      args.Value,
 		Identifier: args.Identifier,
 	}
+
+	log := kv.rf.GetLog()
+	if args.PrevIndex < len(log) {
+		for i, l := range log[args.PrevIndex:] {
+			if l.Command.(Op) == op {
+				DPrintf("Found duplicate on PutAppend")
+				reply.WrongLeader = false
+				reply.Index = args.PrevIndex + i
+				kv.mu.Unlock()
+				return
+			}
+		}
+	}
+
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
@@ -96,7 +129,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	DPrintf("Server %d started PutAppend on %d", kv.me, index)
+	_, prs := kv.registerApply[index]
+	if prs {
+		kv.registerApply[index] <- raft.ApplyMsg{
+			CommandValid: false,
+		}
+		close(kv.registerApply[index])
+	}
 
 	ch := make(chan raft.ApplyMsg)
 	kv.registerApply[index] = ch
@@ -104,26 +143,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	applyMsg := <-ch
 
+	if !applyMsg.CommandValid {
+		reply.WrongLeader = true
+		return
+	}
 	if op == applyMsg.Command.(Op) {
 		reply.WrongLeader = false
-		kv.mu.Lock()
-		switch op.Type {
-		case "Put": kv.data[op.Key] = op.Value
-		case "Append":
-			v, prs := kv.data[op.Key]
-			if !prs {
-				kv.data[op.Key] = op.Value
-			} else {
-				kv.data[op.Key] = v + op.Value
-			}
-		default: panic("invalid command")
-		}
-		kv.mu.Unlock()
+		reply.Index = index - 1
 	} else {
 		reply.WrongLeader = true
 		reply.Err = "Leader Change"
 	}
-	DPrintf("Server %d finished PutAppend", kv.me)
 }
 
 //
@@ -177,13 +207,38 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 func (kv *KVServer) waitApplyThread() {
 	for ap := range kv.applyCh {
-		if kv.killed { break }
+		if kv.killed {
+			break
+		}
 		kv.mu.Lock()
+		op := ap.Command.(Op)
+		if op.Type == "Put" || op.Type == "Append" {
+			switch op.Type {
+			case "Put":
+				kv.data[op.Key] = op.Value
+			case "Append":
+				v, prs := kv.data[op.Key]
+				if !prs {
+					kv.data[op.Key] = op.Value
+				} else {
+					kv.data[op.Key] = v + op.Value
+				}
+			default:
+				panic("invalid command")
+			}
+		}
 		ch, prs := kv.registerApply[ap.CommandIndex]
 		if prs {
 			ch <- ap
 			close(ch)
+			delete(kv.registerApply, ap.CommandIndex)
 		}
 		kv.mu.Unlock()
 	}
+}
+
+// invalidate all pending requests when leader changes
+// safe because duplicate detection
+func (kv *KVServer) watchLeaderChangeThread() {
+
 }

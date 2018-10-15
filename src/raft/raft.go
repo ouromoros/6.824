@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"labgob"
 	"labrpc"
-	"log"
 	"math/rand"
 	"sync"
 	"time"
@@ -92,6 +91,16 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.currentStatus == leader
+}
+
+func (rf *Raft) GetLog() []Log {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	var logs []Log
+	if len(rf.log) > 1 {
+		logs = rf.log[1:]
+	}
+	return logs
 }
 
 //
@@ -204,7 +213,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// rf.DPrintf("Server %d sending ap to %d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -295,7 +303,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	// rf.DPrintf("Server %d sending rv to %d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -326,7 +333,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = true
 		rf.log = append(rf.log, Log{command, rf.currentTerm})
 		rf.persist()
-		rf.DPrintf("Server %d recevied client command", rf.me)
 	} else {
 		isLeader = false
 	}
@@ -344,13 +350,6 @@ func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	rf.debug = 0
 	rf.mu.Unlock()
-}
-
-func (rf *Raft) DPrintf(format string, a ...interface{}) (n int, err error) {
-	if rf.debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
 }
 
 //
@@ -381,11 +380,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.updateTimeoutCh = make(chan struct{}, 1)
 
 	rf.killed = false
-	rf.debug = Debug
 
 	// Your initialization code here (2A, 2B, 2C).
 	// Watch for timeout here. If timeout, start a another term
-	rf.DPrintf("server %d start", me)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -469,13 +466,11 @@ func (rf *Raft) appendEntries() {
 							}
 							if matchCount > len(rf.peers)/2 {
 								rf.commitIndex = index
-								rf.DPrintf("Server %d: commit index updated to %d", rf.me, rf.commitIndex)
 							} else {
 								break
 							}
 						}
 					}
-					// rf.DPrintf("Server %d: client %d success on %d", rf.me, server, thisMatchIndex+len(entries))
 					rf.tryWakeApply()
 				} else {
 					if thisTerm < reply.Term {
@@ -491,7 +486,6 @@ func (rf *Raft) appendEntries() {
 						} else {
 							rf.nextIndex[server] = min(rf.nextIndex[server], prevLogIndex)
 						}
-						rf.DPrintf("Server %d: client %d fail on %d", rf.me, server, prevLogIndex)
 						rf.appendEntries()
 						assert(rf.nextIndex[server] > 0)
 					}
@@ -528,7 +522,7 @@ func (rf *Raft) updateTimeout() {
 }
 
 func (rf *Raft) turnCandidate() {
-	rf.DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
+	DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
 	rf.currentStatus = candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
@@ -537,14 +531,14 @@ func (rf *Raft) turnCandidate() {
 }
 
 func (rf *Raft) turnFollower(term int) {
-	rf.DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+	DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
 	rf.currentStatus = follower
 	rf.currentTerm = term
 	rf.votedFor = -1
 }
 
 func (rf *Raft) turnLeader() {
-	rf.DPrintf("Server %d has become leader on Term %d", rf.me, rf.currentTerm)
+	DPrintf("Server %d has become leader on Term %d", rf.me, rf.currentTerm)
 	rf.currentStatus = leader
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -573,7 +567,6 @@ func (rf *Raft) requestVotes() {
 				var reply RequestVoteReply
 				ok := rf.sendRequestVote(server, &args, &reply)
 				if !ok {
-					rf.DPrintf("Server %d send rv fail!", rf.me)
 					return
 				}
 
@@ -587,7 +580,6 @@ func (rf *Raft) requestVotes() {
 					return
 				}
 				if reply.VoteGranted {
-					rf.DPrintf("Server %d has got vote from %d", rf.me, server)
 					voteCount++
 				}
 				if voteCount > len(rf.peers)/2 {

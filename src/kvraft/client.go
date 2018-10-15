@@ -11,6 +11,7 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	prevLeader int
+	prevIndex int
 }
 
 func nrand() int64 {
@@ -25,6 +26,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.prevLeader = 0
+	ck.prevIndex = 0
 	return ck
 }
 
@@ -42,11 +44,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 
-	// You will have to modify this function.
-	DPrintf("Client sending Get")
 	var args GetArgs
 
 	args.Key = key
+	args.PrevIndex = ck.prevIndex
 	args.Identifier = nrand()
 
 	numServer := len(ck.servers)
@@ -55,15 +56,14 @@ func (ck *Clerk) Get(key string) string {
 		server := (i + ck.prevLeader) % numServer
 		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
 		if !ok || reply.WrongLeader {
-			DPrintf("Client send Get to Server %d fail", server)
-			continue
 		} else {
-			DPrintf("Client send Get to Server %d succeed", server)
 			ck.prevLeader = server
+			ck.prevIndex = reply.Index
+			DPrintf("Get %v succeed on %v", key, server)
 			return reply.Value
 		}
 
-		if i == numServer - 1 {
+		if i == numServer-1 {
 			time.Sleep(time.Duration(500) * time.Millisecond)
 		}
 	}
@@ -80,13 +80,12 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
-	DPrintf("Client sending PutAppend")
 	var args PutAppendArgs
 
 	args.Key = key
 	args.Value = value
 	args.Op = op
+	args.PrevIndex = ck.prevIndex
 	args.Identifier = nrand()
 
 	numServer := len(ck.servers)
@@ -95,14 +94,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		server := (i + ck.prevLeader) % numServer
 		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
 		if !ok || reply.WrongLeader {
-			DPrintf("Client send PutAppend to Server %d fail", server)
-			continue
 		} else {
-			DPrintf("Client send PutAppend to Server %d succeed", server)
 			ck.prevLeader = server
+			ck.prevIndex = reply.Index
+			DPrintf("PutAppend %v: %v succed on %v", key, value, server)
 			return
 		}
-		if i == numServer - 1 {
+		if i == numServer-1 {
 			time.Sleep(time.Duration(500) * time.Millisecond)
 		}
 	}

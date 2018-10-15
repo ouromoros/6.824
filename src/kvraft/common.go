@@ -16,21 +16,25 @@ type PutAppendArgs struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	Identifier int64
+	PrevIndex	 int
 }
 
 type PutAppendReply struct {
 	WrongLeader bool
 	Err         Err
+	Index				int
 }
 
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
 	Identifier int64
+	PrevIndex		int
 }
 
 type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+	Index				int
 }
