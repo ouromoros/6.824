@@ -70,6 +70,7 @@ type Raft struct {
 	currentStatus   status
 	wakeApplyCh     chan struct{}
 	updateTimeoutCh chan struct{}
+	leaderChangeCh  chan struct{}
 	// persistent
 	currentTerm int
 	log         []Log
@@ -98,7 +99,7 @@ func (rf *Raft) GetLog() []Log {
 	defer rf.mu.Unlock()
 	var logs []Log
 	if len(rf.log) > 1 {
-		logs = rf.log[1:]
+		logs = rf.log[1:rf.commitIndex + 1]
 	}
 	return logs
 }
@@ -378,6 +379,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastApplied = 0
 	rf.wakeApplyCh = make(chan struct{}, 1)
 	rf.updateTimeoutCh = make(chan struct{}, 1)
+	rf.leaderChangeCh = make(chan struct{}, 1)
 
 	rf.killed = false
 
@@ -532,6 +534,12 @@ func (rf *Raft) turnCandidate() {
 
 func (rf *Raft) turnFollower(term int) {
 	DPrintf("Server %d has become follower on Term %d", rf.me, rf.currentTerm)
+	if rf.currentStatus == leader {
+		select {
+		case rf.leaderChangeCh <- struct{}{}:
+		default:
+		}
+	}
 	rf.currentStatus = follower
 	rf.currentTerm = term
 	rf.votedFor = -1
@@ -613,4 +621,8 @@ func (rf *Raft) tryWakeApply() {
 	case rf.wakeApplyCh <- struct{}{}:
 	default:
 	}
+}
+
+func (rf *Raft) GetLeaderChangeCh() chan struct{} {
+	return rf.leaderChangeCh
 }
