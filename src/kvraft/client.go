@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"labrpc"
 	"math/big"
-	"time"
 )
 
 type Clerk struct {
@@ -26,7 +25,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.prevLeader = 0
-	ck.prevIndex = 0
+	ck.prevIndex = 1
 	return ck
 }
 
@@ -55,16 +54,11 @@ func (ck *Clerk) Get(key string) string {
 		var reply GetReply
 		server := (i + ck.prevLeader) % numServer
 		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
-		if !ok || reply.WrongLeader {
-		} else {
+		if ok && !reply.WrongLeader {
 			ck.prevLeader = server
 			ck.prevIndex = reply.Index
-			DPrintf("Get %v succeed on %v", key, server)
+			DPrintf("Get %v succeed by %v", key, reply.Index)
 			return reply.Value
-		}
-
-		if i == numServer-1 {
-			time.Sleep(time.Duration(500) * time.Millisecond)
 		}
 	}
 }
@@ -93,15 +87,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		var reply PutAppendReply
 		server := (i + ck.prevLeader) % numServer
 		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
-		if !ok || reply.WrongLeader {
-		} else {
+		if ok && !reply.WrongLeader {
 			ck.prevLeader = server
 			ck.prevIndex = reply.Index
-			DPrintf("PutAppend %v: %v succed on %v", key, value, server)
+			DPrintf("PutAppend %v: %v succeed by %d", key, value, reply.Index)
 			return
-		}
-		if i == numServer-1 {
-			time.Sleep(time.Duration(500) * time.Millisecond)
 		}
 	}
 }

@@ -36,10 +36,16 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	registerApply map[int]chan raft.ApplyMsg
-	killed        bool
+	regApplyMap map[int]regApplyInfo
+	killed      bool
 
 	data map[string]string
+}
+
+type regApplyInfo struct {
+	op Op
+	ch chan bool
+	prevIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -47,22 +53,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := Op{
 		Type:       "Get",
 		Key:        args.Key,
-		Identifier: args.Identifier,
 		Value:      "",
-	}
-
-	log := kv.rf.GetLog()
-	if args.PrevIndex < len(log) {
-		for i, l := range log[args.PrevIndex:] {
-			if l.Command.(Op) == op {
-				DPrintf("Found duplicate on Get")
-				reply.WrongLeader = false
-				reply.Value = kv.data[op.Key]
-				reply.Index = args.PrevIndex + i
-				kv.mu.Unlock()
-				return
-			}
-		}
+		Identifier: args.Identifier,
 	}
 
 	index, _, isLeader := kv.rf.Start(op)
@@ -73,29 +65,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	_, prs := kv.registerApply[index]
-	if prs {
-		kv.registerApply[index] <- raft.ApplyMsg{
-			CommandValid: false,
-		}
-		close(kv.registerApply[index])
-	}
-
-	ch := make(chan raft.ApplyMsg)
-	kv.registerApply[index] = ch
+	ch := make(chan bool)
+	kv.regApply(index, op, ch, args.PrevIndex)
 	kv.mu.Unlock()
 
-	applyMsg := <-ch
+	success := <-ch
 
-	if op == applyMsg.Command.(Op) {
+	if success {
 		reply.WrongLeader = false
 		kv.mu.Lock()
 		reply.Value = kv.data[op.Key]
-		reply.Index = index - 1
+		reply.Index = index
 		kv.mu.Unlock()
 	} else {
 		reply.WrongLeader = true
 		reply.Err = "Leader Change"
+		return
 	}
 }
 
@@ -108,19 +93,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Identifier: args.Identifier,
 	}
 
-	log := kv.rf.GetLog()
-	if args.PrevIndex < len(log) {
-		for i, l := range log[args.PrevIndex:] {
-			if l.Command.(Op) == op {
-				DPrintf("Found duplicate on PutAppend")
-				reply.WrongLeader = false
-				reply.Index = args.PrevIndex + i
-				kv.mu.Unlock()
-				return
-			}
-		}
-	}
-
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
@@ -129,31 +101,28 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	_, prs := kv.registerApply[index]
-	if prs {
-		kv.registerApply[index] <- raft.ApplyMsg{
-			CommandValid: false,
-		}
-		close(kv.registerApply[index])
-	}
-
-	ch := make(chan raft.ApplyMsg)
-	kv.registerApply[index] = ch
+	ch := make(chan bool)
+	kv.regApply(index, op, ch, args.PrevIndex)
 	kv.mu.Unlock()
 
-	applyMsg := <-ch
+	success := <-ch
 
-	if !applyMsg.CommandValid {
-		reply.WrongLeader = true
-		return
-	}
-	if op == applyMsg.Command.(Op) {
+	if success {
 		reply.WrongLeader = false
-		reply.Index = index - 1
+		reply.Index = index
 	} else {
 		reply.WrongLeader = true
 		reply.Err = "Leader Change"
 	}
+}
+
+func (kv *KVServer) regApply(index int, op Op, ch chan bool, prevIndex int) {
+	_, prs := kv.regApplyMap[index]
+	if prs {
+		kv.invalidatePendingRequest(index)
+	}
+
+	kv.regApplyMap[index] = regApplyInfo{op, ch, prevIndex}
 }
 
 //
@@ -197,10 +166,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.registerApply = make(map[int]chan raft.ApplyMsg)
+	kv.regApplyMap = make(map[int]regApplyInfo)
 	kv.data = make(map[string]string)
 	kv.killed = false
 	go kv.waitApplyThread()
+	go kv.watchLeaderChangeThread()
 
 	return kv
 }
@@ -211,34 +181,68 @@ func (kv *KVServer) waitApplyThread() {
 			break
 		}
 		kv.mu.Lock()
-		op := ap.Command.(Op)
-		if op.Type == "Put" || op.Type == "Append" {
-			switch op.Type {
-			case "Put":
-				kv.data[op.Key] = op.Value
-			case "Append":
-				v, prs := kv.data[op.Key]
-				if !prs {
-					kv.data[op.Key] = op.Value
-				} else {
-					kv.data[op.Key] = v + op.Value
-				}
-			default:
-				panic("invalid command")
+
+		index := ap.CommandIndex
+		prevIndex := 1
+
+		info, prs := kv.regApplyMap[index]
+		if prs {
+			if ap.Command.(Op) == info.op {
+				prevIndex = info.prevIndex
+				info.ch <- true
+				delete(kv.regApplyMap, ap.CommandIndex)
+			} else {
+				kv.invalidatePendingRequest(index)
 			}
 		}
-		ch, prs := kv.registerApply[ap.CommandIndex]
-		if prs {
-			ch <- ap
-			close(ch)
-			delete(kv.registerApply, ap.CommandIndex)
-		}
+
+		op := ap.Command.(Op)
+		kv.applyOP(prevIndex,index, op)
+
 		kv.mu.Unlock()
+	}
+}
+
+func (kv *KVServer) applyOP(prevIndex int, index int, op Op) {
+	log := kv.rf.GetLog()
+	for _, l := range log[prevIndex-1:index - 1] {
+		if l.Command.(Op) == op {
+			DPrintf("Found duplicate on PutAppend")
+			return
+		}
+	}
+
+	switch op.Type {
+	case "Put":
+		kv.data[op.Key] = op.Value
+	case "Append":
+		v, prs := kv.data[op.Key]
+		if !prs {
+			kv.data[op.Key] = op.Value
+		} else {
+			kv.data[op.Key] = v + op.Value
+		}
+	case "Get":
+	default:
+		panic("unknown Op type")
 	}
 }
 
 // invalidate all pending requests when leader changes
 // safe because duplicate detection
 func (kv *KVServer) watchLeaderChangeThread() {
+	ch := kv.rf.GetLeaderChangeCh()
+	for {
+		<-ch
+		kv.mu.Lock()
+		for i := range kv.regApplyMap {
+			kv.invalidatePendingRequest(i)
+		}
+		kv.mu.Unlock()
+	}
+}
 
+func (kv *KVServer) invalidatePendingRequest(i int) {
+	kv.regApplyMap[i].ch <- false
+	delete(kv.regApplyMap, i)
 }
