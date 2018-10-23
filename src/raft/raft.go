@@ -481,93 +481,98 @@ func (rf *Raft) sendHeartBeatsThread() {
 
 // Send AppendEntries RPC to all peers. Called by leader. Should be called when holding lock.
 func (rf *Raft) appendEntries() {
-	thisTerm := rf.currentTerm
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			// make a local copy of everything that's going to be needed for the goroutine
-			// will raise race conditions if not done
-			server := i
-			prevLogIndex := rf.nextIndex[server] - 1
-			prevLogTerm := rf.log[prevLogIndex].Term
-			entriesLen := len(rf.log) - rf.nextIndex[server]
-			entries := make([]Log, entriesLen)
-			copy(entries, rf.log[rf.nextIndex[server]:])
-			thisNextIndex := rf.nextIndex[server]
-			thisMatchIndex := rf.matchIndex[server]
-			commitIndex := rf.commitIndex
-			assert(prevLogIndex < len(rf.log))
-			assert(prevLogIndex >= 0)
-
-			args := AppendEntriesArgs{
-				Term:         thisTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: commitIndex,
-			}
-
-			// spawn a separate goroutine for handling RPC with each peer
-			go func() {
-				var reply AppendEntriesReply
-				// set entries according to prevLogIndex
-				ok := rf.sendAppendEntries(server, &args, &reply)
-				if !ok {
-					return
-				}
-
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				// check if reply is out-dated
-				if reply.Term > rf.currentTerm {
-					rf.turnFollower(reply.Term)
-					return
-				}
-				if rf.currentTerm != thisTerm {
-					return
-				}
-				// handle reply
-				if reply.Success {
-					rf.matchIndex[server] = max(thisNextIndex+len(entries)-1, rf.matchIndex[server])
-					rf.nextIndex[server] = max(thisNextIndex+len(entries), rf.nextIndex[server])
-					for index := rf.commitIndex + 1; index < len(rf.log); index++ {
-						if rf.log[index].Term == rf.currentTerm {
-							matchCount := 1
-							for i := 0; i < len(rf.peers); i++ {
-								if i != rf.me && rf.matchIndex[i] >= index {
-									matchCount++
-								}
-							}
-							if matchCount > len(rf.peers)/2 {
-								rf.commitIndex = index
-							} else {
-								break
-							}
-						}
-					}
-					rf.tryWakeApply()
-				} else {
-					if thisTerm < reply.Term {
-						rf.turnFollower(reply.Term)
-					} else {
-						// try to reduce errors caused
-						if rf.nextIndex[server] != thisNextIndex || rf.matchIndex[server] != thisMatchIndex {
-							return
-						}
-						if reply.FailTerm < args.PrevLogTerm {
-							for rf.log[rf.nextIndex[server]-1].Term > reply.FailTerm {
-								rf.nextIndex[server]--
-							}
-						} else {
-							rf.nextIndex[server] = min(rf.nextIndex[server], prevLogIndex)
-						}
-						assert(rf.nextIndex[server] > 0)
-					}
-				}
-			}()
-
+			rf.appendEntriesTo(i)
 		}
 	}
+}
+
+func (rf *Raft) appendEntriesTo(server int) {
+	thisTerm := rf.currentTerm
+	// make a local copy of everything that's going to be needed for the goroutine
+	// will raise race conditions if not done
+	prevLogIndex := rf.nextIndex[server] - 1
+	prevLogTerm := rf.log[prevLogIndex].Term
+	entriesLen := len(rf.log) - rf.nextIndex[server]
+	entries := make([]Log, entriesLen)
+	copy(entries, rf.log[rf.nextIndex[server]:])
+	thisNextIndex := rf.nextIndex[server]
+	thisMatchIndex := rf.matchIndex[server]
+	commitIndex := rf.commitIndex
+	assert(prevLogIndex < len(rf.log))
+	assert(prevLogIndex >= 0)
+
+	args := AppendEntriesArgs{
+		Term:         thisTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+
+	// spawn a separate goroutine for handling RPC with each peer
+	go func() {
+		var reply AppendEntriesReply
+		// set entries according to prevLogIndex
+		ok := rf.sendAppendEntries(server, &args, &reply)
+		if !ok {
+			return
+		}
+
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		// check if reply is out-dated
+		if reply.Term > rf.currentTerm {
+			rf.turnFollower(reply.Term)
+			return
+		}
+		if rf.currentTerm != thisTerm {
+			return
+		}
+		// handle reply
+		if reply.Success {
+			// try to update matchIndex and nextIndex
+			rf.matchIndex[server] = max(thisNextIndex+len(entries)-1, rf.matchIndex[server])
+			rf.nextIndex[server] = max(thisNextIndex+len(entries), rf.nextIndex[server])
+			// try to commit new logs
+			for index := rf.commitIndex + 1; index < len(rf.log); index++ {
+				if rf.log[index].Term == rf.currentTerm {
+					matchCount := 1
+					for i := 0; i < len(rf.peers); i++ {
+						if i != rf.me && rf.matchIndex[i] >= index {
+							matchCount++
+						}
+					}
+					if matchCount > len(rf.peers)/2 {
+						rf.commitIndex = index
+					} else {
+						break
+					}
+				}
+			}
+			rf.tryWakeApply()
+		} else {
+			if thisTerm < reply.Term {
+				rf.turnFollower(reply.Term)
+			} else {
+				// try to decrease nextIndex to match follower
+				if rf.nextIndex[server] != thisNextIndex || rf.matchIndex[server] != thisMatchIndex {
+					return
+				}
+				if reply.FailTerm < args.PrevLogTerm {
+					for rf.log[rf.nextIndex[server]-1].Term > reply.FailTerm {
+						rf.nextIndex[server]--
+					}
+				} else {
+					rf.nextIndex[server] = min(rf.nextIndex[server], prevLogIndex)
+				}
+				assert(rf.nextIndex[server] > 0)
+				rf.appendEntriesTo(server)
+			}
+		}
+	}()
 }
 
 // Started as a separate goroutine at start, detects timeout
