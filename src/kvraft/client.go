@@ -10,7 +10,8 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	prevLeader int
-	prevIndex int
+	nextSeqNum		 int
+	id				 int64
 }
 
 func nrand() int64 {
@@ -25,7 +26,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.prevLeader = 0
-	ck.prevIndex = 1
+	ck.nextSeqNum = 0
+	ck.id	= nrand()
 	return ck
 }
 
@@ -46,8 +48,8 @@ func (ck *Clerk) Get(key string) string {
 	var args GetArgs
 
 	args.Key = key
-	args.PrevIndex = ck.prevIndex
-	args.Identifier = nrand()
+	args.SeqNum = ck.nextSeqNum
+	args.ClientID = ck.id
 
 	numServer := len(ck.servers)
 	for i := 0; ; i = (i + 1) % numServer {
@@ -56,7 +58,7 @@ func (ck *Clerk) Get(key string) string {
 		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
 		if ok && !reply.WrongLeader {
 			ck.prevLeader = server
-			ck.prevIndex = reply.Index
+			ck.nextSeqNum++
 			DPrintf("Get %v succeed by %v", key, reply.Index)
 			return reply.Value
 		}
@@ -79,8 +81,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-	args.PrevIndex = ck.prevIndex
-	args.Identifier = nrand()
+	args.ClientID = ck.id
+	args.SeqNum = ck.nextSeqNum
 
 	numServer := len(ck.servers)
 	for i := 0; ; i = (i + 1) % numServer {
@@ -89,7 +91,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
 		if ok && !reply.WrongLeader {
 			ck.prevLeader = server
-			ck.prevIndex = reply.Index
+			ck.nextSeqNum++
 			DPrintf("PutAppend %v: %v succeed by %d", key, value, reply.Index)
 			return
 		}

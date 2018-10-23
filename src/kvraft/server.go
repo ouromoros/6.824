@@ -24,7 +24,8 @@ type Op struct {
 	Type       string
 	Key        string
 	Value      string
-	Identifier int64
+	ClientID	 int64
+	SeqNum		 int
 }
 
 type KVServer struct {
@@ -38,6 +39,7 @@ type KVServer struct {
 	// Your definitions here.
 	regApplyMap map[int]regApplyInfo
 	killed      bool
+	clientMap		map[int64]int
 
 	data map[string]string
 }
@@ -45,7 +47,6 @@ type KVServer struct {
 type regApplyInfo struct {
 	op Op
 	ch chan bool
-	prevIndex int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -54,7 +55,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Type:       "Get",
 		Key:        args.Key,
 		Value:      "",
-		Identifier: args.Identifier,
+		ClientID:		args.ClientID,
+		SeqNum:			args.SeqNum,
 	}
 
 	index, _, isLeader := kv.rf.Start(op)
@@ -66,7 +68,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	ch := make(chan bool)
-	kv.regApply(index, op, ch, args.PrevIndex)
+	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
 	success := <-ch
@@ -90,7 +92,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Type:       args.Op,
 		Key:        args.Key,
 		Value:      args.Value,
-		Identifier: args.Identifier,
+		ClientID:		args.ClientID,
+		SeqNum:			args.SeqNum,
 	}
 
 	index, _, isLeader := kv.rf.Start(op)
@@ -102,7 +105,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	ch := make(chan bool)
-	kv.regApply(index, op, ch, args.PrevIndex)
+	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
 	success := <-ch
@@ -116,13 +119,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
-func (kv *KVServer) regApply(index int, op Op, ch chan bool, prevIndex int) {
+func (kv *KVServer) regApply(index int, op Op, ch chan bool) {
 	_, prs := kv.regApplyMap[index]
 	if prs {
 		kv.invalidatePendingRequest(index)
 	}
 
-	kv.regApplyMap[index] = regApplyInfo{op, ch, prevIndex}
+	kv.regApplyMap[index] = regApplyInfo{op, ch}
 }
 
 //
@@ -169,6 +172,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.regApplyMap = make(map[int]regApplyInfo)
 	kv.data = make(map[string]string)
 	kv.killed = false
+	kv.clientMap = make(map[int64]int)
 	go kv.waitApplyThread()
 	go kv.watchLeaderChangeThread()
 
@@ -183,12 +187,10 @@ func (kv *KVServer) waitApplyThread() {
 		kv.mu.Lock()
 
 		index := ap.CommandIndex
-		prevIndex := 1
 
 		info, prs := kv.regApplyMap[index]
 		if prs {
 			if ap.Command.(Op) == info.op {
-				prevIndex = info.prevIndex
 				info.ch <- true
 				delete(kv.regApplyMap, ap.CommandIndex)
 			} else {
@@ -197,19 +199,17 @@ func (kv *KVServer) waitApplyThread() {
 		}
 
 		op := ap.Command.(Op)
-		kv.applyOP(prevIndex,index, op)
+		kv.applyOP(op)
 
 		kv.mu.Unlock()
 	}
 }
 
-func (kv *KVServer) applyOP(prevIndex int, index int, op Op) {
-	log := kv.rf.GetLog()
-	for _, l := range log[prevIndex-1:index - 1] {
-		if l.Command.(Op) == op {
-			DPrintf("Found duplicate on PutAppend")
-			return
-		}
+func (kv *KVServer) applyOP(op Op) {
+	seq, prs := kv.clientMap[op.ClientID]
+	if prs && seq >= op.SeqNum {
+		DPrintf("Detect duplicate!")
+		return
 	}
 
 	switch op.Type {
@@ -226,6 +226,7 @@ func (kv *KVServer) applyOP(prevIndex int, index int, op Op) {
 	default:
 		panic("unknown Op type")
 	}
+	kv.clientMap[op.ClientID] = op.SeqNum
 }
 
 // invalidate all pending requests when leader changes
