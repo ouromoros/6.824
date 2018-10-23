@@ -41,6 +41,10 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+
+	// When ApplySnapshot is true, the state should be reset to SnapshotState
+	ApplySnapshot bool
+	SnapshotState interface{}
 }
 
 type Log struct {
@@ -48,6 +52,7 @@ type Log struct {
 	Term    int
 }
 
+// enum type for the status of raft instance
 type status int
 
 const (
@@ -81,8 +86,12 @@ type Raft struct {
 	// volatile on leader
 	nextIndex  []int
 	matchIndex []int
+	// snapshot
+	haveSnapshot  bool
+	snapshotState interface{}
+	snapshotIndex int
+	snapshotTerm  int
 
-	debug  int
 	killed bool
 }
 
@@ -92,16 +101,6 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.currentStatus == leader
-}
-
-func (rf *Raft) GetLog() []Log {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	var logs []Log
-	if len(rf.log) > 1 {
-		logs = rf.log[1:rf.commitIndex + 1]
-	}
-	return logs
 }
 
 //
@@ -115,6 +114,14 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.haveSnapshot)
+	// if there's snapshot, encode them
+	if rf.haveSnapshot {
+		e.Encode(rf.snapshotState)
+		e.Encode(rf.snapshotIndex)
+		e.Encode(rf.snapshotTerm)
+	}
+
 	rf.persister.SaveRaftState(w.Bytes())
 }
 
@@ -130,11 +137,27 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []Log
+	var haveSnapshot bool
+	var snapshotState interface{}
+	var snapshotIndex int
+	var snapshotTerm int
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil {
+		d.Decode(&log) != nil ||
+		d.Decode(&haveSnapshot) != nil {
 		panic("Decode Failed!")
 	} else {
+		// if there's snapshot, decode them
+		if haveSnapshot {
+			if d.Decode(&snapshotState) != nil ||
+				d.Decode(&snapshotIndex) != nil ||
+				d.Decode(&snapshotTerm) != nil {
+				panic("Decode Failed!")
+			}
+			rf.snapshotState = snapshotState
+			rf.snapshotIndex = snapshotIndex
+			rf.snapshotTerm = snapshotTerm
+		}
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
@@ -274,6 +297,45 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+type InstallSnapshotArgs struct {
+	Term          int
+	State         interface{}
+	snapshotIndex int
+	snapshotTerm  int
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.haveSnapshot = true
+	rf.snapshotState = args.State
+	rf.snapshotIndex = args.snapshotIndex
+	rf.snapshotTerm = args.snapshotTerm
+
+	rf.applyCh <- ApplyMsg{
+		CommandValid:  false,
+		ApplySnapshot: true,
+		SnapshotState: rf.snapshotState,
+	}
+
+	reply.Term = rf.currentTerm
+}
+
+func (rf *Raft) saveSnapshot(state interface{}, index int) {
+
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -349,7 +411,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	rf.mu.Lock()
-	rf.debug = 0
+	rf.killed = true
 	rf.mu.Unlock()
 }
 
@@ -371,35 +433,38 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.applyCh = applyCh
 	rf.me = me
+	// state
 	rf.currentTerm = 1
 	rf.currentStatus = follower
-	// rf.lastTimeFromLeader = time.Now().Add(time.Duration(-900) * time.Millisecond)
 	rf.log = make([]Log, 1)
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	// utils
 	rf.wakeApplyCh = make(chan struct{}, 1)
 	rf.updateTimeoutCh = make(chan struct{}, 1)
 	rf.leaderChangeCh = make(chan struct{}, 1)
+	// snapshot
+	rf.haveSnapshot = false
+	rf.snapshotIndex = 0
+	rf.snapshotTerm = 0
 
 	rf.killed = false
 
-	// Your initialization code here (2A, 2B, 2C).
-	// Watch for timeout here. If timeout, start a another term
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 	rf.run()
-
 	return rf
 }
 
 func (rf *Raft) run() {
+	// Start long-running goroutines
 	go rf.sendHeartBeatsThread()
 	go rf.tryApplyThread()
 	go rf.detectTimeOutThread()
 }
 
+// Started as separate goroutine at start. Periodically check if one's leader and send
+// AppendEntries RPCs if is.
 func (rf *Raft) sendHeartBeatsThread() {
 	for {
 		if rf.killed {
@@ -414,10 +479,13 @@ func (rf *Raft) sendHeartBeatsThread() {
 	}
 }
 
+// Send AppendEntries RPC to all peers. Called by leader. Should be called when holding lock.
 func (rf *Raft) appendEntries() {
 	thisTerm := rf.currentTerm
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
+			// make a local copy of everything that's going to be needed for the goroutine
+			// will raise race conditions if not done
 			server := i
 			prevLogIndex := rf.nextIndex[server] - 1
 			prevLogTerm := rf.log[prevLogIndex].Term
@@ -429,6 +497,7 @@ func (rf *Raft) appendEntries() {
 			commitIndex := rf.commitIndex
 			assert(prevLogIndex < len(rf.log))
 			assert(prevLogIndex >= 0)
+
 			args := AppendEntriesArgs{
 				Term:         thisTerm,
 				LeaderId:     rf.me,
@@ -438,6 +507,7 @@ func (rf *Raft) appendEntries() {
 				LeaderCommit: commitIndex,
 			}
 
+			// spawn a separate goroutine for handling RPC with each peer
 			go func() {
 				var reply AppendEntriesReply
 				// set entries according to prevLogIndex
@@ -448,6 +518,7 @@ func (rf *Raft) appendEntries() {
 
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
+				// check if reply is out-dated
 				if reply.Term > rf.currentTerm {
 					rf.turnFollower(reply.Term)
 					return
@@ -455,6 +526,7 @@ func (rf *Raft) appendEntries() {
 				if rf.currentTerm != thisTerm {
 					return
 				}
+				// handle reply
 				if reply.Success {
 					rf.matchIndex[server] = max(thisNextIndex+len(entries)-1, rf.matchIndex[server])
 					rf.nextIndex[server] = max(thisNextIndex+len(entries), rf.nextIndex[server])
@@ -478,6 +550,7 @@ func (rf *Raft) appendEntries() {
 					if thisTerm < reply.Term {
 						rf.turnFollower(reply.Term)
 					} else {
+						// try to reduce errors caused
 						if rf.nextIndex[server] != thisNextIndex || rf.matchIndex[server] != thisMatchIndex {
 							return
 						}
@@ -488,7 +561,6 @@ func (rf *Raft) appendEntries() {
 						} else {
 							rf.nextIndex[server] = min(rf.nextIndex[server], prevLogIndex)
 						}
-						rf.appendEntries()
 						assert(rf.nextIndex[server] > 0)
 					}
 				}
@@ -498,6 +570,7 @@ func (rf *Raft) appendEntries() {
 	}
 }
 
+// Started as a separate goroutine at start, detects timeout
 func (rf *Raft) detectTimeOutThread() {
 	for {
 		if rf.killed {
@@ -516,6 +589,7 @@ func (rf *Raft) detectTimeOutThread() {
 	}
 }
 
+// Called to prevent timeout occuring, is non-blocking
 func (rf *Raft) updateTimeout() {
 	select {
 	case rf.updateTimeoutCh <- struct{}{}:
@@ -523,6 +597,7 @@ func (rf *Raft) updateTimeout() {
 	}
 }
 
+// All turn... functions should be called when holding lock
 func (rf *Raft) turnCandidate() {
 	DPrintf("Server %d has become candidate on Term %d", rf.me, rf.currentTerm)
 	rf.currentStatus = candidate
@@ -598,24 +673,35 @@ func (rf *Raft) requestVotes() {
 	}
 }
 
+// Started as separate goroutine at start, won't hold lock for long
+// will try to apply commited log when `tryWakeApply()` is called
+// `rf.wakeapplyCh` is a buffered channel, so it is guaranteed no to miss updates
+// even if called multiple times when running one round
 func (rf *Raft) tryApplyThread() {
 	for {
 		if rf.killed {
 			break
 		}
+		// this is safe because commitIndex only increments, and it doesn't matter if
+		// a race occurs. wakeApply will hold the notification
 		thisCommitIndex := rf.commitIndex
 		for i := rf.lastApplied + 1; i <= thisCommitIndex; i++ {
-			rf.applyCh <- ApplyMsg{
+			// required because the possibility of snapshot occuring
+			rf.mu.Lock()
+			applyMsg := ApplyMsg{
 				CommandValid: true,
 				CommandIndex: i,
 				Command:      rf.log[i].Command,
 			}
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
 		}
 		rf.lastApplied = thisCommitIndex
 		<-rf.wakeApplyCh
 	}
 }
 
+// Wakes the apply thread. Is non-blocking.
 func (rf *Raft) tryWakeApply() {
 	select {
 	case rf.wakeApplyCh <- struct{}{}:
