@@ -85,6 +85,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.SeqNum = ck.nextSeqNum
 
 	numServer := len(ck.servers)
+	DPrintf("PutAppend %v: %v pending", key, value)
 	for i := 0; ; i = (i + 1) % numServer {
 		var reply PutAppendReply
 		server := (i + ck.prevLeader) % numServer

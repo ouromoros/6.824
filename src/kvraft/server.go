@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -21,11 +22,11 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Type       string
-	Key        string
-	Value      string
-	ClientID	 int64
-	SeqNum		 int
+	Type     string
+	Key      string
+	Value    string
+	ClientID int64
+	SeqNum   int
 }
 
 type KVServer struct {
@@ -39,7 +40,7 @@ type KVServer struct {
 	// Your definitions here.
 	regApplyMap map[int]regApplyInfo
 	killed      bool
-	clientMap		map[int64]int
+	clientMap   map[int64]int
 
 	data map[string]string
 }
@@ -49,14 +50,19 @@ type regApplyInfo struct {
 	ch chan bool
 }
 
+type State struct {
+	ClientMap map[int64]int
+	Data      map[string]string
+}
+
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	op := Op{
-		Type:       "Get",
-		Key:        args.Key,
-		Value:      "",
-		ClientID:		args.ClientID,
-		SeqNum:			args.SeqNum,
+		Type:     "Get",
+		Key:      args.Key,
+		Value:    "",
+		ClientID: args.ClientID,
+		SeqNum:   args.SeqNum,
 	}
 
 	index, _, isLeader := kv.rf.Start(op)
@@ -89,11 +95,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	op := Op{
-		Type:       args.Op,
-		Key:        args.Key,
-		Value:      args.Value,
-		ClientID:		args.ClientID,
-		SeqNum:			args.SeqNum,
+		Type:     args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		ClientID: args.ClientID,
+		SeqNum:   args.SeqNum,
 	}
 
 	index, _, isLeader := kv.rf.Start(op)
@@ -165,7 +171,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -173,6 +179,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.data = make(map[string]string)
 	kv.killed = false
 	kv.clientMap = make(map[int64]int)
+
 	go kv.waitApplyThread()
 	go kv.watchLeaderChangeThread()
 
@@ -184,10 +191,27 @@ func (kv *KVServer) waitApplyThread() {
 		if kv.killed {
 			break
 		}
+		if ap.ApplySnapshot {
+			kv.mu.Lock()
+			snapshot := ap.SnapshotState
+			r := bytes.NewBuffer(snapshot)
+			d := labgob.NewDecoder(r)
+			var state State
+			if d.Decode(&state) != nil {
+				panic("Decode Failed!")
+			}
+
+			kv.clientMap = state.ClientMap
+			kv.data = state.Data
+			for i := range kv.regApplyMap {
+				kv.invalidatePendingRequest(i)
+			}
+			kv.mu.Unlock()
+			continue
+		}
+
 		kv.mu.Lock()
-
 		index := ap.CommandIndex
-
 		info, prs := kv.regApplyMap[index]
 		if prs {
 			if ap.Command.(Op) == info.op {
@@ -197,10 +221,19 @@ func (kv *KVServer) waitApplyThread() {
 				kv.invalidatePendingRequest(index)
 			}
 		}
-
 		op := ap.Command.(Op)
 		kv.applyOP(op)
 
+		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+			state := State{
+				ClientMap: kv.clientMap,
+				Data:      kv.data,
+			}
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(state)
+			kv.rf.SaveSnapshot(w.Bytes(), index)
+		}
 		kv.mu.Unlock()
 	}
 }
