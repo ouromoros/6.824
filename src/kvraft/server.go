@@ -83,7 +83,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.WrongLeader = false
 		kv.mu.Lock()
 		reply.Value = kv.data[op.Key]
-		reply.Index = index
 		kv.mu.Unlock()
 	} else {
 		reply.WrongLeader = true
@@ -118,7 +117,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	if success {
 		reply.WrongLeader = false
-		reply.Index = index
 	} else {
 		reply.WrongLeader = true
 		reply.Err = "Leader Change"

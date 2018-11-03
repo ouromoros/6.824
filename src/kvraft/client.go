@@ -1,18 +1,18 @@
 package raftkv
 
 import (
-	"time"
 	"crypto/rand"
 	"labrpc"
 	"math/big"
+	"time"
 )
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 	prevLeader int
-	nextSeqNum		 int
-	id				 int64
+	nextSeqNum int
+	id         int64
 }
 
 func nrand() int64 {
@@ -28,7 +28,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// You'll have to add code here.
 	ck.prevLeader = 0
 	ck.nextSeqNum = 0
-	ck.id	= nrand()
+	ck.id = nrand()
 	return ck
 }
 
@@ -53,21 +53,18 @@ func (ck *Clerk) Get(key string) string {
 	args.ClientID = ck.id
 
 	numServer := len(ck.servers)
-	for i := 0; ; i = (i + 1) % numServer {
-		var reply GetReply
-		server := (i + ck.prevLeader) % numServer
-		ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
-		if ok && !reply.WrongLeader {
-			ck.prevLeader = server
-			ck.nextSeqNum++
-			DPrintf("Get %v succeed by %v", key, reply.Index)
-			return reply.Value
-		} else {
-			DPrintf("Failed!")
+	for {
+		for i := 0; ; i = (i + 1) % numServer {
+			var reply GetReply
+			server := (i + ck.prevLeader) % numServer
+			ok := ck.servers[server].Call("KVServer.Get", &args, &reply)
+			if ok && !reply.WrongLeader {
+				ck.prevLeader = server
+				ck.nextSeqNum++
+				return reply.Value
+			}
 		}
-		if i == numServer - 1 {
-			time.Sleep(time.Millisecond * 500)
-		}
+		time.Sleep(time.Millisecond * 500)
 	}
 }
 
@@ -92,21 +89,18 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	numServer := len(ck.servers)
 	DPrintf("PutAppend %v: %v pending", key, value)
-	for i := 0; ; i = (i + 1) % numServer {
-		var reply PutAppendReply
-		server := (i + ck.prevLeader) % numServer
-		ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
-		if ok && !reply.WrongLeader {
-			ck.prevLeader = server
-			ck.nextSeqNum++
-			DPrintf("PutAppend %v: %v succeed by %d", key, value, reply.Index)
-			return
-		} else {
-			DPrintf("Failed!")
+	for {
+		for i := 0; ; i = (i + 1) % numServer {
+			var reply PutAppendReply
+			server := (i + ck.prevLeader) % numServer
+			ok := ck.servers[server].Call("KVServer.PutAppend", &args, &reply)
+			if ok && !reply.WrongLeader {
+				ck.prevLeader = server
+				ck.nextSeqNum++
+				return
+			}
 		}
-		if i == numServer - 1 {
-			time.Sleep(time.Millisecond * 500)
-		}
+		time.Sleep(time.Millisecond * 500)
 	}
 }
 
