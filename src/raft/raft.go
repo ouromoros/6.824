@@ -95,6 +95,9 @@ type Raft struct {
 	killed bool
 }
 
+const appendEntriesInterval time.Duration = time.Millisecond * 100
+const timeOut int = 1000
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -220,6 +223,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// bit of hack. If prevLogIndex < snapshotIndex, make it look like prevLogIndex = snapshotIndex
 	if args.PrevLogIndex < rf.snapshotIndex {
+		if args.PrevLogIndex + len(args.Entries) <= rf.snapshotIndex {
+			reply.Term = rf.currentTerm
+			reply.Success = true
+			return
+		}
 		args.Entries = args.Entries[rf.snapshotIndex-args.PrevLogIndex:]
 		args.PrevLogIndex = rf.snapshotIndex
 	}
@@ -350,6 +358,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.snapshotState = args.State
 		rf.snapshotIndex = args.SnapshotIndex
 		rf.snapshotTerm = args.SnapshotTerm
+	} else {
+		return
 	}
 
 	if args.SnapshotIndex < len(rf.log)+prevSnapshotIndex-1 && rf.log[args.SnapshotIndex-prevSnapshotIndex].Term == args.SnapshotTerm {
@@ -453,6 +463,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = true
 		rf.log = append(rf.log, Log{command, rf.currentTerm})
 		rf.persist()
+		// append immdiately
+		rf.appendEntries()
 	} else {
 		isLeader = false
 	}
@@ -531,7 +543,7 @@ func (rf *Raft) sendHeartBeatsThread() {
 		if rf.killed {
 			break
 		}
-		time.Sleep(time.Duration(100) * time.Millisecond)
+		time.Sleep(appendEntriesInterval)
 		rf.mu.Lock()
 		if rf.currentStatus == leader {
 			rf.appendEntries()
@@ -554,7 +566,7 @@ func (rf *Raft) appendEntriesTo(server int) {
 	// make a local copy of everything that's going to be needed for the goroutine
 	// will raise race conditions if not done
 	if rf.nextIndex[server] <= rf.snapshotIndex {
-		rf.nextIndex[server] = rf.snapshotIndex + 1
+		return
 	}
 	prevLogIndex := rf.nextIndex[server] - 1
 	prevLogTerm := rf.log[prevLogIndex-rf.snapshotIndex].Term
@@ -633,7 +645,7 @@ func (rf *Raft) appendEntriesTo(server int) {
 					rf.nextIndex[server] = min(rf.nextIndex[server], prevLogIndex)
 				}
 
-				assert(rf.nextIndex[server] >= rf.snapshotIndex)
+				// assert(rf.nextIndex[server] >= rf.snapshotIndex)
 				if rf.nextIndex[server]-1 <= rf.snapshotIndex && rf.haveSnapshot {
 					go rf.sendInstallSnapshotTo(server)
 				} else{
@@ -689,7 +701,7 @@ func (rf *Raft) detectTimeOutThread() {
 		if rf.killed {
 			break
 		}
-		timeOut := time.Duration(rand.Intn(1000)+1000) * time.Millisecond
+		timeOut := time.Duration(rand.Intn(timeOut)+timeOut) * time.Millisecond
 		select {
 		case <-time.After(timeOut):
 			rf.mu.Lock()

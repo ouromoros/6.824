@@ -110,7 +110,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	ch := make(chan bool)
+	ch := make(chan bool, 1)
 	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
@@ -232,6 +232,7 @@ func (kv *KVServer) waitApplyThread() {
 			w := new(bytes.Buffer)
 			e := labgob.NewEncoder(w)
 			e.Encode(state)
+			DPrintf("Saving snapshot")
 			kv.rf.SaveSnapshot(w.Bytes(), index)
 		}
 		kv.mu.Unlock()

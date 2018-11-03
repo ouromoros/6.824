@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"time"
 	"crypto/rand"
 	"labrpc"
 	"math/big"
@@ -61,6 +62,11 @@ func (ck *Clerk) Get(key string) string {
 			ck.nextSeqNum++
 			DPrintf("Get %v succeed by %v", key, reply.Index)
 			return reply.Value
+		} else {
+			DPrintf("Failed!")
+		}
+		if i == numServer - 1 {
+			time.Sleep(time.Millisecond * 500)
 		}
 	}
 }
@@ -95,6 +101,11 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			ck.nextSeqNum++
 			DPrintf("PutAppend %v: %v succeed by %d", key, value, reply.Index)
 			return
+		} else {
+			DPrintf("Failed!")
+		}
+		if i == numServer - 1 {
+			time.Sleep(time.Millisecond * 500)
 		}
 	}
 }
