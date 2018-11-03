@@ -51,6 +51,7 @@ func (ck *Clerk) Query(num int) Config {
 			if ok && reply.WrongLeader == false {
 				ck.prevLeader = server
 				ck.nextSeqNum++
+				DPrintf("%v", reply.Config)
 				return reply.Config
 			}
 		}
