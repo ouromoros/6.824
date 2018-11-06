@@ -84,7 +84,6 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	}
 }
 
-
 func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.

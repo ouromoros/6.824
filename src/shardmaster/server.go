@@ -42,14 +42,14 @@ type Op struct {
 	SeqNum   int
 
 	// Join args
-	Servers  map[int][]string
+	Servers map[int][]string
 	// Leave args
-	GIDS     []int
+	GIDS []int
 	// Move args
-	Shard    int
-	GID      int
+	Shard int
+	GID   int
 	// Query args
-	Num      int
+	Num int
 }
 
 func (sm *ShardMaster) Join(args *JoinArgs, reply *JoinReply) {
@@ -348,7 +348,7 @@ func join(conf Config, servers map[int][]string) Config {
 	}
 	dist := getBalancedDistribution(NShards, len(groups))
 	gsMap := getGidShardMap(conf.Shards)
-	gidByCount := getGidSortedByCountArray(conf.Groups,conf.Shards)
+	gidByCount := getGidSortedByCountArray(conf.Groups, conf.Shards)
 	freeShard := make([]int, 0)
 
 	if conf.Shards[0] == 0 {
