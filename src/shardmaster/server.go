@@ -7,7 +7,7 @@ import "labgob"
 import "sort"
 import "log"
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -348,7 +348,7 @@ func join(conf Config, servers map[int][]string) Config {
 	}
 	dist := getBalancedDistribution(NShards, len(groups))
 	gsMap := getGidShardMap(conf.Shards)
-	gidByCount := getGidSortedByCountArray(conf.Shards)
+	gidByCount := getGidSortedByCountArray(conf.Groups,conf.Shards)
 	freeShard := make([]int, 0)
 
 	if conf.Shards[0] == 0 {
@@ -401,7 +401,7 @@ func leave(conf Config, gids []int) Config {
 	}
 	dist := getBalancedDistribution(NShards, len(groups))
 	gsMap := getGidShardMap(conf.Shards)
-	gidByCount := getGidSortedByCountArray(conf.Shards)
+	gidByCount := getGidSortedByCountArray(conf.Groups, conf.Shards)
 
 	freeShard := make([]int, 0)
 	for _, gid := range gids {
@@ -459,6 +459,7 @@ func copyOfGroups(m map[int][]string) map[int][]string {
 }
 
 func gidShardMapToShards(gsMap map[int][]int) [NShards]int {
+	// initialialized to 0s, so if no group in gsMap, will return invalid(correct) result
 	var result [NShards]int
 	for gid, shards := range gsMap {
 		for _, shard := range shards {
@@ -482,15 +483,14 @@ func getGidShardMap(shards [NShards]int) map[int][]int {
 	return gidMap
 }
 
-func getGidSortedByCountArray(shards [NShards]int) []int {
+func getGidSortedByCountArray(groups map[int][]string, shards [NShards]int) []int {
 	// fix: include those that aren't assigned any shard
 	gidCount := make(map[int]int)
+	for g := range groups {
+		gidCount[g] = 0
+	}
 	for _, gid := range shards {
-		if _, prs := gidCount[gid]; prs {
-			gidCount[gid]++
-		} else {
-			gidCount[gid] = 1
-		}
+		gidCount[gid]++
 	}
 
 	slice := make([]int, 0, len(gidCount))
