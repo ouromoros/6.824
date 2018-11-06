@@ -1,18 +1,35 @@
 package shardkv
 
-
 // import "shardmaster"
-import "labrpc"
-import "raft"
-import "sync"
-import "labgob"
+import (
+	"shardmaster"
+	"labrpc"
+	"raft"
+	"sync"
+	"labgob"
+	"log"
+	"bytes"
+)
 
+const Debug = 0
 
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type     string
+	ClientID int64
+	SeqNum   int
+
+	Key   string
+	Value string
 }
 
 type ShardKV struct {
@@ -26,15 +43,99 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data map[string]string
+
+	mck 				*shardmaster.Clerk
+	regApplyMap map[int]regApplyInfo
+	killed      bool
+	clientMap   map[int64]int
 }
 
+type regApplyInfo struct {
+	op Op
+	ch chan bool
+}
+
+type State struct {
+	ClientMap map[int64]int
+	Data      map[string]string
+}
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+	op := Op{
+		Type:     "Get",
+		Key:      args.Key,
+		Value:    "",
+		ClientID: args.ClientID,
+		SeqNum:   args.SeqNum,
+	}
+
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		reply.Err = "Not Leader"
+		kv.mu.Unlock()
+		return
+	}
+
+	ch := make(chan bool)
+	kv.regApply(index, op, ch)
+	kv.mu.Unlock()
+
+	success := <-ch
+
+	if success {
+		reply.WrongLeader = false
+		kv.mu.Lock()
+		reply.Value = kv.data[op.Key]
+		kv.mu.Unlock()
+	} else {
+		reply.WrongLeader = true
+		reply.Err = "Leader Change"
+		return
+	}
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.mu.Lock()
+	op := Op{
+		Type:     args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		ClientID: args.ClientID,
+		SeqNum:   args.SeqNum,
+	}
+
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		reply.Err = "Not Leader"
+		kv.mu.Unlock()
+		return
+	}
+
+	ch := make(chan bool, 1)
+	kv.regApply(index, op, ch)
+	kv.mu.Unlock()
+
+	success := <-ch
+
+	if success {
+		reply.WrongLeader = false
+	} else {
+		reply.WrongLeader = true
+		reply.Err = "Leader Change"
+	}
+}
+
+func (kv *ShardKV) regApply(index int, op Op, ch chan bool) {
+	_, prs := kv.regApplyMap[index]
+	if prs {
+		kv.invalidatePendingRequest(index)
+	}
+
+	kv.regApplyMap[index] = regApplyInfo{op, ch}
 }
 
 //
@@ -46,8 +147,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.killed = true
 }
-
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -89,14 +190,118 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.gid = gid
 	kv.masters = masters
 
-	// Your initialization code here.
 
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.mck = shardmaster.MakeClerk(kv.masters)
 
+	// Your initialization code here.
+	kv.regApplyMap = make(map[int]regApplyInfo)
+	kv.data = make(map[string]string)
+	kv.killed = false
+	kv.clientMap = make(map[int64]int)
+
+	go kv.waitApplyThread()
+	go kv.watchLeaderChangeThread()
 
 	return kv
+}
+
+func (kv *ShardKV) waitApplyThread() {
+	for ap := range kv.applyCh {
+		if kv.killed {
+			break
+		}
+		if ap.ApplySnapshot {
+			kv.mu.Lock()
+			snapshot := ap.SnapshotState
+			r := bytes.NewBuffer(snapshot)
+			d := labgob.NewDecoder(r)
+			var state State
+			if d.Decode(&state) != nil {
+				panic("Decode Failed!")
+			}
+
+			kv.clientMap = state.ClientMap
+			kv.data = state.Data
+			for i := range kv.regApplyMap {
+				kv.invalidatePendingRequest(i)
+			}
+			kv.mu.Unlock()
+			continue
+		}
+
+		kv.mu.Lock()
+		index := ap.CommandIndex
+		info, prs := kv.regApplyMap[index]
+		if prs {
+			if ap.Command.(Op) == info.op {
+				info.ch <- true
+				delete(kv.regApplyMap, ap.CommandIndex)
+			} else {
+				kv.invalidatePendingRequest(index)
+			}
+		}
+		op := ap.Command.(Op)
+		kv.applyOP(op)
+
+		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+			state := State{
+				ClientMap: kv.clientMap,
+				Data:      kv.data,
+			}
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(state)
+			DPrintf("Saving snapshot")
+			kv.rf.SaveSnapshot(w.Bytes(), index)
+		}
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *ShardKV) applyOP(op Op) {
+	seq, prs := kv.clientMap[op.ClientID]
+	if prs && seq >= op.SeqNum {
+		DPrintf("Detect duplicate!")
+		return
+	}
+
+	switch op.Type {
+	case "Put":
+		kv.data[op.Key] = op.Value
+	case "Append":
+		v, prs := kv.data[op.Key]
+		if !prs {
+			kv.data[op.Key] = op.Value
+		} else {
+			kv.data[op.Key] = v + op.Value
+		}
+	case "Get":
+	default:
+		panic("unknown Op type")
+	}
+	kv.clientMap[op.ClientID] = op.SeqNum
+}
+
+// invalidate all pending requests when leader changes
+// safe because duplicate detection
+func (kv *ShardKV) watchLeaderChangeThread() {
+	ch := kv.rf.GetLeaderChangeCh()
+	for {
+		<-ch
+		kv.mu.Lock()
+		for i := range kv.regApplyMap {
+			kv.invalidatePendingRequest(i)
+		}
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *ShardKV) invalidatePendingRequest(i int) {
+	kv.regApplyMap[i].ch <- false
+	delete(kv.regApplyMap, i)
 }

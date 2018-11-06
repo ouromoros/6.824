@@ -40,6 +40,8 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	nextSeqNum int
+	id         int64
 }
 
 //
@@ -56,6 +58,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.nextSeqNum = 0
+	ck.id = nrand()
 	return ck
 }
 
@@ -68,6 +72,8 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.ClientID = ck.id
+	args.SeqNum = ck.nextSeqNum
 
 	for {
 		shard := key2shard(key)
@@ -79,6 +85,7 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.nextSeqNum++
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -103,6 +110,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
+	args.ClientID = ck.id
+	args.SeqNum = ck.nextSeqNum
 
 
 	for {
@@ -114,6 +123,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.WrongLeader == false && reply.Err == OK {
+					ck.nextSeqNum++
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
