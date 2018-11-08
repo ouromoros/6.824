@@ -387,10 +387,24 @@ func (kv *ShardKV) startConfig(config shardmaster.Config) {
 	kv.debug("started config %d", config.Num)
 	op := Op{
 		IsReconfig: true,
-		Config:     config,
+		Config:     configCopy(config),
 	}
 	kv.rf.Start(op)
 }
+
+func configCopy(config shardmaster.Config) shardmaster.Config {
+	g := make(map[int][]string)
+	for k, v := range config.Groups {
+		g[k] = v
+	}
+	s := config.Shards
+	return shardmaster.Config{
+		Num:    config.Num,
+		Shards: s,
+		Groups: g,
+	}
+}
+
 
 func (kv *ShardKV) applyConfig(config shardmaster.Config) {
 	if config.Num <= kv.config.Num {
