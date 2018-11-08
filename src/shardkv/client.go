@@ -13,6 +13,8 @@ import "crypto/rand"
 import "math/big"
 import "shardmaster"
 import "time"
+import "log"
+import "fmt"
 
 //
 // which shard is a key in?
@@ -63,6 +65,13 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	return ck
 }
 
+func (ck *Clerk) debug(format string, a ...interface{}) (n int, err error) {
+	if Debug > 0 {
+		log.Printf(fmt.Sprintf("Clerk %v: ", ck.id)+format, a...)
+	}
+	return
+}
+
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -70,6 +79,7 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
+	ck.debug("Start Get Request")
 	args := GetArgs{}
 	args.Key = key
 	args.ClientID = ck.id
@@ -106,13 +116,13 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
+	ck.debug("Start Get Request")
 	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
 	args.Op = op
 	args.ClientID = ck.id
 	args.SeqNum = ck.nextSeqNum
-
 
 	for {
 		shard := key2shard(key)

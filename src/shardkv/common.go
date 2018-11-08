@@ -10,9 +10,10 @@ package shardkv
 //
 
 const (
-	OK            = "OK"
-	ErrNoKey      = "ErrNoKey"
-	ErrWrongGroup = "ErrWrongGroup"
+	OK              = "OK"
+	ErrNoKey        = "ErrNoKey"
+	ErrWrongGroup   = "ErrWrongGroup"
+	ErrLeaderChange = "ErrLeaderChange"
 )
 
 type Err string

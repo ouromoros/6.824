@@ -2,20 +2,22 @@ package shardkv
 
 // import "shardmaster"
 import (
-	"shardmaster"
-	"labrpc"
-	"raft"
-	"sync"
-	"labgob"
-	"log"
 	"bytes"
+	"fmt"
+	"labgob"
+	"labrpc"
+	"log"
+	"raft"
+	"shardmaster"
+	"sync"
+	"time"
 )
 
 const Debug = 0
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
+func (kv *ShardKV) debug(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		log.Printf(format, a...)
+		log.Printf(fmt.Sprintf("Server %2d %2d: ", kv.gid, kv.me)+format, a...)
 	}
 	return
 }
@@ -30,6 +32,15 @@ type Op struct {
 
 	Key   string
 	Value string
+
+	IsReconfig bool
+	Config     shardmaster.Config
+}
+
+type Shard struct {
+	mu        sync.Mutex
+	data      map[string]string
+	clientMap map[int64]int
 }
 
 type ShardKV struct {
@@ -43,22 +54,24 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	data map[string]string
+	// data map[string]string
+	data   map[int]Shard
+	config shardmaster.Config
 
-	mck 				*shardmaster.Clerk
-	regApplyMap map[int]regApplyInfo
-	killed      bool
-	clientMap   map[int64]int
+	pendingConfigNum int
+	mck              *shardmaster.Clerk
+	regApplyMap      map[int]regApplyInfo
+	killed           bool
 }
 
 type regApplyInfo struct {
 	op Op
-	ch chan bool
+	ch chan Err
 }
 
 type State struct {
-	ClientMap map[int64]int
-	Data      map[string]string
+	Data   map[int]Shard
+	Config shardmaster.Config
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
@@ -74,27 +87,28 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
-		reply.Err = "Not Leader"
 		kv.mu.Unlock()
 		return
 	}
 
-	ch := make(chan bool)
+	ch := make(chan Err, 1)
 	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
-	success := <-ch
+	err := <-ch
 
-	if success {
+	switch err {
+	case OK:
 		reply.WrongLeader = false
 		kv.mu.Lock()
-		reply.Value = kv.data[op.Key]
+		reply.Value = kv.data[key2shard(op.Key)].data[op.Key]
 		kv.mu.Unlock()
-	} else {
+	case ErrWrongGroup:
+		reply.WrongLeader = false
+	case ErrLeaderChange:
 		reply.WrongLeader = true
-		reply.Err = "Leader Change"
-		return
 	}
+	reply.Err = err
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -115,24 +129,30 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	ch := make(chan bool, 1)
+	ch := make(chan Err, 1)
 	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
-	success := <-ch
+	err := <-ch
 
-	if success {
+	switch err {
+	case OK:
 		reply.WrongLeader = false
-	} else {
+		kv.mu.Lock()
+		kv.mu.Unlock()
+	case ErrWrongGroup:
+		reply.WrongLeader = false
+	case ErrLeaderChange:
 		reply.WrongLeader = true
-		reply.Err = "Leader Change"
 	}
+	reply.Err = err
 }
 
-func (kv *ShardKV) regApply(index int, op Op, ch chan bool) {
-	_, prs := kv.regApplyMap[index]
+func (kv *ShardKV) regApply(index int, op Op, ch chan Err) {
+	info, prs := kv.regApplyMap[index]
 	if prs {
-		kv.invalidatePendingRequest(index)
+		info.ch <- ErrLeaderChange
+		delete(kv.regApplyMap, index)
 	}
 
 	kv.regApplyMap[index] = regApplyInfo{op, ch}
@@ -190,7 +210,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.gid = gid
 	kv.masters = masters
 
-
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
@@ -200,12 +219,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	// Your initialization code here.
 	kv.regApplyMap = make(map[int]regApplyInfo)
-	kv.data = make(map[string]string)
+	kv.data = make(map[int]Shard)
 	kv.killed = false
-	kv.clientMap = make(map[int64]int)
 
 	go kv.waitApplyThread()
 	go kv.watchLeaderChangeThread()
+	go kv.watchConfigurationThread()
 
 	return kv
 }
@@ -215,76 +234,113 @@ func (kv *ShardKV) waitApplyThread() {
 		if kv.killed {
 			break
 		}
-		if ap.ApplySnapshot {
-			kv.mu.Lock()
-			snapshot := ap.SnapshotState
-			r := bytes.NewBuffer(snapshot)
-			d := labgob.NewDecoder(r)
-			var state State
-			if d.Decode(&state) != nil {
-				panic("Decode Failed!")
-			}
 
-			kv.clientMap = state.ClientMap
-			kv.data = state.Data
-			for i := range kv.regApplyMap {
-				kv.invalidatePendingRequest(i)
-			}
-			kv.mu.Unlock()
+		if ap.ApplySnapshot {
+			kv.applySnapshot(ap)
 			continue
 		}
 
 		kv.mu.Lock()
 		index := ap.CommandIndex
 		info, prs := kv.regApplyMap[index]
+		op := ap.Command.(Op)
+
+		if op.IsReconfig {
+			kv.applyConfig(op.Config)
+			kv.mu.Unlock()
+			continue
+		}
+
+		shard := key2shard(op.Key)
+		if !kv.haveShard(shard) {
+			if prs {
+				if op.ClientID == info.op.ClientID && op.SeqNum == info.op.SeqNum {
+					info.ch <- ErrWrongGroup
+					delete(kv.regApplyMap, ap.CommandIndex)
+				} else {
+					info.ch <- ErrLeaderChange
+					delete(kv.regApplyMap, ap.CommandIndex)
+				}
+			}
+			kv.mu.Unlock()
+			continue
+		}
+
 		if prs {
-			if ap.Command.(Op) == info.op {
-				info.ch <- true
+			if op.ClientID == info.op.ClientID && op.SeqNum == info.op.SeqNum {
+				info.ch <- OK
 				delete(kv.regApplyMap, ap.CommandIndex)
 			} else {
-				kv.invalidatePendingRequest(index)
+				info.ch <- ErrLeaderChange
+				delete(kv.regApplyMap, ap.CommandIndex)
 			}
 		}
-		op := ap.Command.(Op)
-		kv.applyOP(op)
+		kv.applyOP(op, shard)
 
 		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
-			state := State{
-				ClientMap: kv.clientMap,
-				Data:      kv.data,
-			}
-			w := new(bytes.Buffer)
-			e := labgob.NewEncoder(w)
-			e.Encode(state)
-			DPrintf("Saving snapshot")
-			kv.rf.SaveSnapshot(w.Bytes(), index)
+			kv.saveSnapshot(index)
 		}
 		kv.mu.Unlock()
 	}
 }
 
-func (kv *ShardKV) applyOP(op Op) {
-	seq, prs := kv.clientMap[op.ClientID]
-	if prs && seq >= op.SeqNum {
-		DPrintf("Detect duplicate!")
-		return
+func (kv *ShardKV) haveShard(shardNum int) bool {
+	return kv.config.Shards[shardNum] == kv.gid
+}
+
+func (kv *ShardKV) saveSnapshot(index int) {
+	state := State{
+		Data:   kv.data,
+		Config: kv.config,
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(state)
+	kv.debug("saving snapshot")
+	kv.rf.SaveSnapshot(w.Bytes(), index)
+}
+
+func (kv *ShardKV) applySnapshot(ap raft.ApplyMsg) {
+	kv.mu.Lock()
+	snapshot := ap.SnapshotState
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var state State
+	if d.Decode(&state) != nil {
+		panic("Decode Failed!")
 	}
 
+	kv.data = state.Data
+	kv.config = state.Config
+	for _, info := range kv.regApplyMap {
+		info.ch <- ErrLeaderChange
+		delete(kv.regApplyMap, ap.CommandIndex)
+	}
+	kv.mu.Unlock()
+}
+
+func (kv *ShardKV) applyOP(op Op, shardNum int) {
+	shard := kv.data[shardNum]
+	seq, prs := shard.clientMap[op.ClientID]
+	if prs && seq >= op.SeqNum {
+		kv.debug("detect duplicate!")
+		return
+	}
 	switch op.Type {
 	case "Put":
-		kv.data[op.Key] = op.Value
+		shard.data[op.Key] = op.Value
 	case "Append":
-		v, prs := kv.data[op.Key]
+		v, prs := shard.data[op.Key]
 		if !prs {
-			kv.data[op.Key] = op.Value
+			shard.data[op.Key] = op.Value
 		} else {
-			kv.data[op.Key] = v + op.Value
+			shard.data[op.Key] = v + op.Value
 		}
 	case "Get":
 	default:
 		panic("unknown Op type")
 	}
-	kv.clientMap[op.ClientID] = op.SeqNum
+	shard.clientMap[op.ClientID] = op.SeqNum
 }
 
 // invalidate all pending requests when leader changes
@@ -292,16 +348,63 @@ func (kv *ShardKV) applyOP(op Op) {
 func (kv *ShardKV) watchLeaderChangeThread() {
 	ch := kv.rf.GetLeaderChangeCh()
 	for {
+		if kv.killed {
+			break
+		}
+
 		<-ch
 		kv.mu.Lock()
-		for i := range kv.regApplyMap {
-			kv.invalidatePendingRequest(i)
+		for index, info := range kv.regApplyMap {
+			info.ch <- ErrLeaderChange
+			delete(kv.regApplyMap, index)
 		}
 		kv.mu.Unlock()
 	}
 }
 
-func (kv *ShardKV) invalidatePendingRequest(i int) {
-	kv.regApplyMap[i].ch <- false
-	delete(kv.regApplyMap, i)
+func (kv *ShardKV) watchConfigurationThread() {
+	for {
+		if kv.killed {
+			break
+		}
+
+		kv.mu.Lock()
+		thisConfigNum := kv.config.Num
+		kv.mu.Unlock()
+
+		config := kv.mck.Query(thisConfigNum + 1)
+
+		kv.mu.Lock()
+		if config.Num == kv.config.Num+1 {
+			kv.startConfig(config)
+		}
+		kv.mu.Unlock()
+		time.Sleep(200)
+	}
+}
+
+func (kv *ShardKV) startConfig(config shardmaster.Config) {
+	kv.debug("started config %d", config.Num)
+	op := Op{
+		IsReconfig: true,
+		Config:     config,
+	}
+	kv.rf.Start(op)
+}
+
+func (kv *ShardKV) applyConfig(config shardmaster.Config) {
+	if config.Num <= kv.config.Num {
+		return
+	}
+	kv.debug("current config is %v, applying config %v", kv.config.Num, config.Num)
+	// applying
+	for shardNum, gid := range config.Shards {
+		if kv.gid == gid {
+			kv.data[shardNum] = Shard{
+				data:      make(map[string]string),
+				clientMap: make(map[int64]int),
+			}
+		}
+	}
+	kv.config = config
 }
