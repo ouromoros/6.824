@@ -48,3 +48,29 @@ type GetReply struct {
 	Err         Err
 	Value       string
 }
+
+type RequestShardArgs struct {
+	ShardNum  int
+	ConfigNum int
+}
+
+type RequestShardReply struct {
+	Success bool
+	Data    Shard
+}
+
+type GetConfigNumArgs struct {
+}
+
+type GetConfigNumReply struct {
+	Num int
+}
+
+type NotifyOldShardArgs struct {
+	ShardNum int
+	ConfNum  int
+}
+
+type NotifyOldShardReply struct {
+	Success bool
+}
