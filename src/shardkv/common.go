@@ -65,12 +65,3 @@ type GetConfigNumArgs struct {
 type GetConfigNumReply struct {
 	Num int
 }
-
-type NotifyOldShardArgs struct {
-	ShardNum int
-	ConfNum  int
-}
-
-type NotifyOldShardReply struct {
-	Success bool
-}
