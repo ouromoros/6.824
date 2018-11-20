@@ -251,9 +251,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.configs = make(map[int]shardmaster.Config)
 	kv.regApplyMap = make(map[int]regApplyInfo)
 	kv.data = make(map[int]*Shard)
+	kv.currentConfig = kv.getConfig(0)
 	kv.killed = false
-
-	kv.initConfig()
 
 	go kv.waitApplyThread()
 	go kv.watchLeaderChangeThread()
@@ -263,23 +262,19 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	return kv
 }
 
-// get latest config and initialize
-func (kv *ShardKV) initConfig() {
-
-}
-
 func (kv *ShardKV) waitApplyThread() {
 	for ap := range kv.applyCh {
 		if kv.killed {
 			break
 		}
 
+		kv.mu.Lock()
 		if ap.ApplySnapshot {
 			kv.applySnapshot(ap)
+			kv.mu.Unlock()
 			continue
 		}
 
-		kv.mu.Lock()
 		index := ap.CommandIndex
 		info, prs := kv.regApplyMap[index]
 		op := ap.Command.(Op)
@@ -335,13 +330,10 @@ func (kv *ShardKV) waitApplyThread() {
 
 func (kv *ShardKV) applyShard(shard Shard) {
 	shardNum := shard.ShardNum
-	kv.mu.Lock()
-	if kv.data[shardNum].Present {
-		kv.mu.Unlock()
+	if kv.data[shardNum].Present && kv.data[shardNum].ConfNum==shard.ConfNum {
 		return
 	}
 
-	defer kv.mu.Unlock()
 	copy := shardCopy(&shard)
 	copy.Owner = kv.gid
 	kv.data[shard.ShardNum] = &copy
@@ -374,7 +366,6 @@ func (kv *ShardKV) saveSnapshot(index int) {
 }
 
 func (kv *ShardKV) applySnapshot(ap raft.ApplyMsg) {
-	kv.mu.Lock()
 	snapshot := ap.SnapshotState
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
@@ -391,7 +382,6 @@ func (kv *ShardKV) applySnapshot(ap raft.ApplyMsg) {
 		delete(kv.regApplyMap, ap.CommandIndex)
 	}
 	kv.tryRequestShards()
-	kv.mu.Unlock()
 }
 
 func (kv *ShardKV) applyOP(op Op, shardNum int) {
@@ -508,7 +498,7 @@ func (kv *ShardKV) applyConfig(config shardmaster.Config) {
 		} else if thisConfig.Shards[shardNum] == gid {
 			kv.data[shardNum].ConfNum = config.Num
 		} else {
-			// kv.requestShard(shardNum, kv.config.Num)
+			// go kv.requestShard(shardNum, kv.config.Num)
 			if shard, prs := kv.data[shardNum]; prs {
 				shard.Present = false
 			} else {
@@ -540,7 +530,6 @@ func (kv *ShardKV) tryRequestShards() {
 	}
 }
 
-// TODO
 // after this function finishes, shard with shardNum should be present
 // halt if config changes in the process since tryReqeustShards will be called again
 func (kv *ShardKV) requestShard(shardNum int, confNum int) {
@@ -549,6 +538,7 @@ func (kv *ShardKV) requestShard(shardNum int, confNum int) {
 	config := kv.getConfig(confNum - 1)
 	servers := config.Groups[config.Shards[shardNum]]
 loop:
+	// try to get the shard
 	for {
 		for _, s := range servers {
 			srv := kv.make_end(s)
@@ -564,49 +554,47 @@ loop:
 		}
 		// It's possible the Shard is committed through log
 		kv.mu.Lock()
-		if kv.data[shardNum].Present {
+		if kv.data[shardNum].Present || kv.currentConfig.Num != confNum {
 			kv.mu.Unlock()
-			break
+			return
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
 	}
 
+	shard.ConfNum = confNum
+	shard.Owner = kv.gid
 	// commit the shard to log
 	for {
 		kv.mu.Lock()
-		if kv.data[shardNum].Present {
+		if kv.data[shardNum].Present || kv.currentConfig.Num != confNum {
 			kv.mu.Unlock()
-			break
+			return
 		}
 		kv.rf.Start(Op{
 			IsShard: true,
 			Shard:   shard,
 		})
 		kv.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(1000 * time.Millisecond)
 	}
 }
 
+// return the requested shard if it exists
 func (kv *ShardKV) RequestShard(args *RequestShardArgs, reply *RequestShardReply) {
-	// kv.shardMuts[args.shardNum].Lock()
-	// defer kv.shardMuts[args.shardNum].Unlock()
-	// bugs here
 	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	_, prs := kv.data[args.ShardNum]
 	if !prs {
 		reply.Success = false
-		kv.mu.Unlock()
 		return
 	}
 	if !kv.data[args.ShardNum].Present || kv.data[args.ShardNum].ConfNum != args.ConfigNum {
 		reply.Success = false
-		kv.mu.Unlock()
 		return
 	}
 
 	reply.Success = true
 	reply.Data = shardCopy(kv.data[args.ShardNum])
-	kv.mu.Unlock()
 }
 
 func shardCopy(shard *Shard) Shard {
@@ -636,16 +624,27 @@ func (kv *ShardKV) GetConfigNum(args *GetConfigNumArgs, reply *GetConfigNumReply
 	}
 }
 
+// can be further optimized (add the configNum to be compared here)
 func (kv *ShardKV) getConfigNum(servers []string) int {
 	var args GetConfigNumArgs
+	ch := make(chan int, len(servers))
 	n := -1
-	// can add concurrency here
 	for _, s := range servers {
 		srv := kv.make_end(s)
 		var reply GetConfigNumReply
-		ok := srv.Call("ShardKV.GetConfigNum", &args, &reply)
-		if ok && reply.Num > n {
-			n = reply.Num
+		go func(){
+			ok := srv.Call("ShardKV.GetConfigNum", &args, &reply)
+			if ok {
+				ch <- reply.Num
+			} else {
+				ch <- -1
+			}
+		}()
+	}
+	for i := 0; i < len(servers); i++ {
+		num := <-ch
+		if num > n {
+			n = num
 		}
 	}
 	return n
@@ -665,25 +664,27 @@ func (kv *ShardKV) getConfig(num int) shardmaster.Config {
 
 // periodically check the config number of other groups, garbage clean safe shards
 func (kv *ShardKV) cleanOldShardThread() {
-	// TODO: very unefficient
-	// var confStatus map[int]int
-	// var mut sync.Mutex
-
 	for {
 		if kv.killed {
 			break
 		}
 		kv.mu.Lock()
-		for shardNum, shard := range kv.data {
-			if shard.ConfNum == kv.currentConfig.Num {
+		for _, shard := range kv.data {
+			if shard.ConfNum == kv.currentConfig.Num || !shard.Present {
 				continue
 			}
-			confNum := kv.getConfigNum(kv.getConfig(shard.ConfNum).Groups[shard.Owner])
-			if confNum >= shard.ConfNum {
-				delete(kv.data, shardNum)
-			}
+			s := shard
+			go func(){
+				confNum := kv.getConfigNum(kv.getConfig(s.ConfNum).Groups[s.Owner])
+				kv.mu.Lock()
+				defer kv.mu.Unlock()
+				if confNum > s.ConfNum {
+					delete(kv.data, s.ShardNum)
+				}
+			}()
 		}
 		kv.mu.Unlock()
+
 		time.Sleep(100 * time.Millisecond)
 	}
 }
