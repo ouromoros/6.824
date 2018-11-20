@@ -79,7 +79,7 @@ func (ck *Clerk) debug(format string, a ...interface{}) (n int, err error) {
 // You will have to modify this function.
 //
 func (ck *Clerk) Get(key string) string {
-	ck.debug("Start Get Request")
+	ck.debug("Start Get Request: %v", key)
 	args := GetArgs{}
 	args.Key = key
 	args.ClientID = ck.id
@@ -116,7 +116,7 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	ck.debug("Start Get Request")
+	ck.debug("Start PutAppend Request: %v %v", key, value)
 	args := PutAppendArgs{}
 	args.Key = key
 	args.Value = value
