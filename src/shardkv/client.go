@@ -84,9 +84,9 @@ func (ck *Clerk) Get(key string) string {
 	args.Key = key
 	args.ClientID = ck.id
 	args.SeqNum = ck.nextSeqNum
-	args.ConfigNum = ck.config.Num
 
 	for {
+		args.ConfigNum = ck.config.Num
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -98,6 +98,9 @@ func (ck *Clerk) Get(key string) string {
 				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
 					ck.nextSeqNum++
 					return reply.Value
+				}
+				if ok && (reply.Err == ErrShardNotReady) {
+					ck.nextSeqNum++
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
@@ -124,9 +127,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Op = op
 	args.ClientID = ck.id
 	args.SeqNum = ck.nextSeqNum
-	args.ConfigNum = ck.config.Num
 
 	for {
+		args.ConfigNum = ck.config.Num
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
@@ -137,6 +140,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				if ok && reply.WrongLeader == false && reply.Err == OK {
 					ck.nextSeqNum++
 					return
+				}
+				if ok && (reply.Err == ErrShardNotReady) {
+					ck.nextSeqNum++
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					break

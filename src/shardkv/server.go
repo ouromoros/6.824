@@ -77,7 +77,8 @@ type ShardKV struct {
 	currentConfig shardmaster.Config
 	pending       bool
 
-	configs           map[int]shardmaster.Config
+	// configs						map[int]shardmaster.Config
+	configs           sync.Map
 	mck               *shardmaster.Clerk
 	regApplyMap       map[int]regApplyInfo
 	killed            bool
@@ -85,7 +86,12 @@ type ShardKV struct {
 
 type regApplyInfo struct {
 	op Op
-	ch chan Err
+	ch chan result
+}
+
+type result struct {
+	err Err
+	value string
 }
 
 type State struct {
@@ -104,6 +110,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		SeqNum:   args.SeqNum,
 	}
 
+	if args.ConfigNum != kv.currentConfig.Num {
+		kv.debug("request confNum: %v, current: %v", args.ConfigNum, kv.currentConfig.Num)
+		kv.tryUpdateConfig()
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
@@ -111,25 +124,19 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.debug("started %v", index)
-	if args.ConfigNum > kv.currentConfig.Num {
-		kv.tryUpdateConfig()
-	}
 
-	ch := make(chan Err, 1)
+	ch := make(chan result, 1)
 	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
-	err := <-ch
+	r := <-ch
+	err := r.err
 
 	kv.debug("%v", err)
 	switch err {
 	case OK:
 		reply.WrongLeader = false
-		shardNum := key2shard(op.Key)
-		// possible race problem, should be passed through channel
-		kv.mu.Lock()
-		reply.Value = kv.data[shardNum].Data[op.Key]
-		kv.mu.Unlock()
+		reply.Value = r.value
 	case ErrWrongGroup:
 		reply.WrongLeader = false
 	case ErrLeaderChange:
@@ -150,6 +157,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		SeqNum:   args.SeqNum,
 	}
 
+	if args.ConfigNum != kv.currentConfig.Num {
+		kv.debug("request confNum: %v, current: %v", args.ConfigNum, kv.currentConfig.Num)
+		kv.tryUpdateConfig()
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
@@ -157,17 +171,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
-	if args.ConfigNum > kv.currentConfig.Num {
-		kv.tryUpdateConfig()
-	}
 	kv.debug("started %v", index)
 
-	ch := make(chan Err, 1)
+	ch := make(chan result, 1)
 	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
-	err := <-ch
+	r := <-ch
+	err := r.err
 
+	kv.debug("%v", err)
 	switch err {
 	case OK:
 		reply.WrongLeader = false
@@ -181,10 +194,10 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = err
 }
 
-func (kv *ShardKV) regApply(index int, op Op, ch chan Err) {
+func (kv *ShardKV) regApply(index int, op Op, ch chan result) {
 	info, prs := kv.regApplyMap[index]
 	if prs {
-		info.ch <- ErrLeaderChange
+		info.ch <- result{ErrLeaderChange, ""}
 		delete(kv.regApplyMap, index)
 	}
 
@@ -246,22 +259,21 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Use something like this to talk to the shardmaster:
 	// kv.mck = shardmaster.MakeClerk(kv.masters)
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.mck = shardmaster.MakeClerk(kv.masters)
 
 	// Your initialization code here.
-	kv.configs = make(map[int]shardmaster.Config)
+	// kv.configs = make(map[int]shardmaster.Config)
 	kv.regApplyMap = make(map[int]regApplyInfo)
 	kv.data = make(map[int]*Shard)
-	kv.currentConfig = kv.getConfig(0)
+	// kv.currentConfig = kv.getConfig(0)
 	kv.killed = false
 
 	go kv.waitApplyThread()
 	go kv.watchLeaderChangeThread()
 	go kv.watchConfigThread()
 	go kv.cleanOldShardThread()
-	kv.debug("server started")
 	if Debug > 0 {
 		go kv.printDebugThread()
 	}
@@ -295,7 +307,7 @@ func (kv *ShardKV) waitApplyThread() {
 		if op.IsShard {
 			kv.debug("apply shard %v", op.Shard.ShardNum)
 			kv.applyShard(op.Shard)
-			if kv.pending && !kv.shardsAllPresent() {
+			if kv.pending && kv.shardsAllPresent() {
 				kv.pending = false
 				kv.tryUpdateConfig()
 			}
@@ -306,17 +318,18 @@ func (kv *ShardKV) waitApplyThread() {
 			continue
 		}
 
-		if prs {
-			if op.ClientID != info.op.ClientID || op.SeqNum != info.op.SeqNum {
-				info.ch <- ErrLeaderChange
+		if op.ClientID != info.op.ClientID || op.SeqNum != info.op.SeqNum {
+			if prs{
+				info.ch <- result{err: ErrLeaderChange}
 				delete(kv.regApplyMap, ap.CommandIndex)
 			}
+			continue
 		}
 
 		shard := key2shard(op.Key)
 		if kv.currentConfig.Shards[shard] != kv.gid {
 			if prs {
-				info.ch <- ErrWrongGroup
+				info.ch <- result{err: ErrWrongGroup}
 				delete(kv.regApplyMap, ap.CommandIndex)
 			}
 			kv.mu.Unlock()
@@ -324,7 +337,7 @@ func (kv *ShardKV) waitApplyThread() {
 		}
 		if !kv.data[shard].Present {
 			if prs {
-				info.ch <- ErrShardNotReady
+				info.ch <- result{err: ErrShardNotReady}
 				delete(kv.regApplyMap, ap.CommandIndex)
 			}
 			kv.mu.Unlock()
@@ -332,16 +345,11 @@ func (kv *ShardKV) waitApplyThread() {
 		}
 
 		// just reject requests when shard not ready
-		kv.applyOP(op, shard)
-		if prs {
+		r := kv.applyOP(op, shard)
+		if prs   {
 			kv.debug("applied %v", index)
-			if op.ClientID == info.op.ClientID && op.SeqNum == info.op.SeqNum {
-				info.ch <- OK
-				delete(kv.regApplyMap, ap.CommandIndex)
-			} else {
-				info.ch <- ErrLeaderChange
-				delete(kv.regApplyMap, ap.CommandIndex)
-			}
+			info.ch <- result{err: OK, value: r}
+			delete(kv.regApplyMap, ap.CommandIndex)
 		}
 
 		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
@@ -353,6 +361,10 @@ func (kv *ShardKV) waitApplyThread() {
 
 func (kv *ShardKV) applyShard(shard Shard) {
 	shardNum := shard.ShardNum
+	assert(shard.ConfNum == kv.currentConfig.Num)
+	if _, prs := kv.data[shardNum]; !prs {
+		return
+	}
 	if kv.data[shardNum].Present {
 		return
 	}
@@ -396,18 +408,19 @@ func (kv *ShardKV) applySnapshot(ap raft.ApplyMsg) {
 	kv.currentConfig = state.Config
 	kv.pending = state.Pending
 	for _, info := range kv.regApplyMap {
-		info.ch <- ErrLeaderChange
+		info.ch <- result{err: ErrLeaderChange}
 		delete(kv.regApplyMap, ap.CommandIndex)
 	}
 	kv.tryRequestShards()
 }
 
-func (kv *ShardKV) applyOP(op Op, shardNum int) {
+func (kv *ShardKV) applyOP(op Op, shardNum int) string {
 	shard := kv.data[shardNum]
 	seq, prs := shard.ClientMap[op.ClientID]
+	result := ""
 	if prs && seq >= op.SeqNum {
 		kv.debug("detect duplicate!")
-		return
+		return result
 	}
 	switch op.Type {
 	case "Put":
@@ -420,10 +433,12 @@ func (kv *ShardKV) applyOP(op Op, shardNum int) {
 			shard.Data[op.Key] = v + op.Value
 		}
 	case "Get":
+		result = shard.Data[op.Key]
 	default:
 		panic("unknown Op type")
 	}
 	shard.ClientMap[op.ClientID] = op.SeqNum
+	return result
 }
 
 // invalidate all pending requests when leader changes
@@ -438,7 +453,7 @@ func (kv *ShardKV) watchLeaderChangeThread() {
 		<-ch
 		kv.mu.Lock()
 		for index, info := range kv.regApplyMap {
-			info.ch <- ErrLeaderChange
+			info.ch <- result{err: ErrLeaderChange}
 			delete(kv.regApplyMap, index)
 		}
 		kv.mu.Unlock()
@@ -451,29 +466,27 @@ func (kv *ShardKV) watchConfigThread() {
 		if kv.killed {
 			break
 		}
-		kv.mu.Lock()
 		kv.tryUpdateConfig()
-		kv.mu.Unlock()
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
 func (kv *ShardKV) tryUpdateConfig() {
 	if !kv.pending {
-		config := kv.getConfig(kv.currentConfig.Num + 1)
-		if !kv.pending && config.Num == kv.currentConfig.Num+1 {
-			kv.startConfig(config)
-		}
+		thisConfigNum := kv.currentConfig.Num
+		go func() {
+			config := kv.getConfig(thisConfigNum + 1)
+			kv.mu.Lock()
+			if config.Num == kv.currentConfig.Num+1 {
+				op := Op{
+					IsReconfig: true,
+					Config:     configCopy(config),
+				}
+				kv.rf.Start(op)
+			}
+			kv.mu.Unlock()
+		}()
 	}
-}
-
-func (kv *ShardKV) startConfig(config shardmaster.Config) {
-	kv.debug("started config %d", config.Num)
-	op := Op{
-		IsReconfig: true,
-		Config:     configCopy(config),
-	}
-	kv.rf.Start(op)
 }
 
 func configCopy(config shardmaster.Config) shardmaster.Config {
@@ -495,14 +508,14 @@ func (kv *ShardKV) applyConfig(config shardmaster.Config) {
 	}
 	kv.debug("applying config %v", config.Num)
 	assert(config.Num == kv.currentConfig.Num+1)
+	assert(kv.shardsAllPresent())
 
-	thisConfig := kv.currentConfig
 	// Process newly added and unchanged shards
 	for shardNum, gid := range config.Shards {
 		if kv.gid != gid {
 			continue
 		}
-		if thisConfig.Shards[shardNum] == 0 {
+		if kv.currentConfig.Shards[shardNum] == 0 {
 			kv.data[shardNum] = &Shard{
 				Data:      make(map[string]string),
 				ClientMap: make(map[int64]int),
@@ -511,7 +524,7 @@ func (kv *ShardKV) applyConfig(config shardmaster.Config) {
 				Present:   true,
 				Owner:     kv.gid,
 			}
-		} else if thisConfig.Shards[shardNum] == gid {
+		} else if kv.currentConfig.Shards[shardNum] == gid {
 			kv.data[shardNum].ConfNum = config.Num
 		} else {
 			// go kv.requestShard(shardNum, kv.config.Num)
@@ -546,6 +559,7 @@ func (kv *ShardKV) tryRequestShards() {
 	for shardNum, shard := range kv.data {
 		if !shard.Present {
 			num := shardNum
+			assert(kv.currentConfig.Shards[shardNum] == kv.gid)
 			go kv.requestShard(num, confNum)
 		}
 	}
@@ -568,6 +582,9 @@ func (kv *ShardKV) requestShard(shardNum int, confNum int) {
 loop:
 	// try to get the shard
 	for {
+		if kv.killed {
+			break
+		}
 		for _, s := range servers {
 			srv := kv.make_end(s)
 			var reply RequestShardReply
@@ -583,6 +600,10 @@ loop:
 		// It's possible the Shard is committed through log
 		kv.debug("requesting Shard %v from %v failed! retrying...", shardNum, config.Shards[shardNum])
 		kv.mu.Lock()
+		if _, prs := kv.data[shardNum]; !prs {
+			kv.mu.Unlock()
+			return
+		}
 		if kv.currentConfig.Num != confNum || kv.data[shardNum].Present {
 			kv.mu.Unlock()
 			return
@@ -597,7 +618,14 @@ loop:
 	// commit the shard to log
 	kv.debug("commiting shard %v", shardNum)
 	for {
+		if kv.killed {
+			break
+		}
 		kv.mu.Lock()
+		if _, prs := kv.data[shardNum]; !prs {
+			kv.mu.Unlock()
+			return
+		}
 		if kv.currentConfig.Num != confNum || kv.data[shardNum].Present {
 			kv.mu.Unlock()
 			break
@@ -618,6 +646,11 @@ func (kv *ShardKV) RequestShard(args *RequestShardArgs, reply *RequestShardReply
 	defer kv.mu.Unlock()
 	shard, prs := kv.data[args.ShardNum]
 	if !prs {
+		reply.Success = false
+		return
+	}
+	if args.ConfigNum == kv.currentConfig.Num {
+		kv.tryUpdateConfig()
 		reply.Success = false
 		return
 	}
@@ -687,13 +720,13 @@ func (kv *ShardKV) compareConfigNum(servers []string, num int) bool {
 }
 
 func (kv *ShardKV) getConfig(num int) shardmaster.Config {
-	config, prs := kv.configs[num]
+	value, prs := kv.configs.Load(num)
 	if prs {
-		return config
+		return value.(shardmaster.Config)
 	}
-	config = kv.mck.Query(num)
+	config := kv.mck.Query(num)
 	if config.Num == num {
-		kv.configs[num] = config
+		kv.configs.Store(num, config)
 	}
 	return config
 }
@@ -717,7 +750,7 @@ func (kv *ShardKV) cleanOldShardThread() {
 				kv.mu.Lock()
 				defer kv.mu.Unlock()
 				shard, prs := kv.data[thisShardNum]
-				if !prs || shard.ConfNum != thisConfigNum {
+				if !prs || shard.ConfNum != thisConfigNum || !shard.Present {
 					return
 				}
 				if safeToDelete {
