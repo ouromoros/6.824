@@ -97,6 +97,7 @@ func (ck *Clerk) Get(key string) string {
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && reply.WrongLeader == false && (reply.Err == OK || reply.Err == ErrNoKey) {
 					ck.nextSeqNum++
+					ck.debug("Finish Get Request: %v", key)
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrShardNotReady) {
@@ -111,8 +112,6 @@ func (ck *Clerk) Get(key string) string {
 		// ask master for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 //
@@ -139,6 +138,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.WrongLeader == false && reply.Err == OK {
 					ck.nextSeqNum++
+					ck.debug("Finish PutAppend Request: %v %v", key, value)
 					return
 				}
 				if ok && (reply.Err == ErrShardNotReady) {

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func (kv *ShardKV) debug(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -78,10 +78,10 @@ type ShardKV struct {
 	pending       bool
 
 	// configs						map[int]shardmaster.Config
-	configs           sync.Map
-	mck               *shardmaster.Clerk
-	regApplyMap       map[int]regApplyInfo
-	killed            bool
+	configs     sync.Map
+	mck         *shardmaster.Clerk
+	regApplyMap map[int]regApplyInfo
+	killed      bool
 }
 
 type regApplyInfo struct {
@@ -90,7 +90,7 @@ type regApplyInfo struct {
 }
 
 type result struct {
-	err Err
+	err   Err
 	value string
 }
 
@@ -129,7 +129,16 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
-	r := <-ch
+	var r result
+out:
+	for {
+		select {
+		case r = <-ch:
+			break out
+		case <-time.After(1000 * time.Millisecond):
+			kv.debug("index %v I'm stuck", index)
+		}
+	}
 	err := r.err
 
 	kv.debug("%v", err)
@@ -167,7 +176,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
-		reply.Err = "Not Leader"
 		kv.mu.Unlock()
 		return
 	}
@@ -177,7 +185,16 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.regApply(index, op, ch)
 	kv.mu.Unlock()
 
-	r := <-ch
+	var r result
+out:
+	for {
+		select {
+		case r = <-ch:
+			break out
+		case <-time.After(1000 * time.Millisecond):
+			kv.debug("index %v I'm stuck", index)
+		}
+	}
 	err := r.err
 
 	kv.debug("%v", err)
@@ -197,7 +214,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *ShardKV) regApply(index int, op Op, ch chan result) {
 	info, prs := kv.regApplyMap[index]
 	if prs {
-		info.ch <- result{ErrLeaderChange, ""}
+		info.ch <- result{err: ErrLeaderChange}
 		delete(kv.regApplyMap, index)
 	}
 
@@ -214,6 +231,12 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 	kv.killed = true
+	kv.mu.Lock()
+	for index, info := range kv.regApplyMap {
+		info.ch <- result{err: ErrLeaderChange}
+		delete(kv.regApplyMap, index)
+	}
+	kv.mu.Unlock()
 }
 
 //
@@ -298,6 +321,13 @@ func (kv *ShardKV) waitApplyThread() {
 		info, prs := kv.regApplyMap[index]
 		op := ap.Command.(Op)
 
+		if op.IsReconfig || op.IsShard {
+			if prs {
+				info.ch <- result{err: ErrLeaderChange}
+				delete(kv.regApplyMap, index)
+			}
+		}
+
 		if op.IsReconfig {
 			kv.applyConfig(op.Config)
 			kv.mu.Unlock()
@@ -318,19 +348,11 @@ func (kv *ShardKV) waitApplyThread() {
 			continue
 		}
 
-		if op.ClientID != info.op.ClientID || op.SeqNum != info.op.SeqNum {
-			if prs{
-				info.ch <- result{err: ErrLeaderChange}
-				delete(kv.regApplyMap, ap.CommandIndex)
-			}
-			continue
-		}
-
 		shard := key2shard(op.Key)
 		if kv.currentConfig.Shards[shard] != kv.gid {
 			if prs {
 				info.ch <- result{err: ErrWrongGroup}
-				delete(kv.regApplyMap, ap.CommandIndex)
+				delete(kv.regApplyMap, index)
 			}
 			kv.mu.Unlock()
 			continue
@@ -338,7 +360,7 @@ func (kv *ShardKV) waitApplyThread() {
 		if !kv.data[shard].Present {
 			if prs {
 				info.ch <- result{err: ErrShardNotReady}
-				delete(kv.regApplyMap, ap.CommandIndex)
+				delete(kv.regApplyMap, index)
 			}
 			kv.mu.Unlock()
 			continue
@@ -346,10 +368,15 @@ func (kv *ShardKV) waitApplyThread() {
 
 		// just reject requests when shard not ready
 		r := kv.applyOP(op, shard)
-		if prs   {
-			kv.debug("applied %v", index)
-			info.ch <- result{err: OK, value: r}
-			delete(kv.regApplyMap, ap.CommandIndex)
+		kv.debug("applied %v", index)
+		if prs {
+			if op.ClientID != info.op.ClientID || op.SeqNum != info.op.SeqNum {
+				info.ch <- result{err: ErrLeaderChange}
+				delete(kv.regApplyMap, index)
+			} else {
+				info.ch <- result{err: OK, value: r}
+				delete(kv.regApplyMap, index)
+			}
 		}
 
 		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
@@ -420,6 +447,9 @@ func (kv *ShardKV) applyOP(op Op, shardNum int) string {
 	result := ""
 	if prs && seq >= op.SeqNum {
 		kv.debug("detect duplicate!")
+		if op.Type == "Get" {
+			result = shard.Data[op.Key]
+		}
 		return result
 	}
 	switch op.Type {
@@ -646,10 +676,12 @@ func (kv *ShardKV) RequestShard(args *RequestShardArgs, reply *RequestShardReply
 	defer kv.mu.Unlock()
 	shard, prs := kv.data[args.ShardNum]
 	if !prs {
+		kv.debug("shard not exist")
 		reply.Success = false
 		return
 	}
 	if args.ConfigNum == kv.currentConfig.Num {
+		kv.debug("config not update")
 		kv.tryUpdateConfig()
 		reply.Success = false
 		return
@@ -774,11 +806,14 @@ func (kv *ShardKV) printDebugThread() {
 		kv.debug("Info:")
 		print("Shards: ")
 		for _, shard := range kv.data {
-			print(shard.ShardNum, " ")
+			if shard.Present && shard.ConfNum == kv.currentConfig.Num {
+				print(shard.ShardNum, " ")
+			}
 		}
 		print("\n")
 		print("Conf: ")
 		print(kv.currentConfig.Num, " ", kv.pending, "\n")
+		kv.debug("%v", kv.regApplyMap)
 		kv.mu.Unlock()
 		time.Sleep(time.Millisecond * 1000)
 	}
