@@ -101,14 +101,16 @@ func (ck *Clerk) Get(key string) string {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrShardNotReady) {
+					ck.debug("not ready")
 					ck.nextSeqNum++
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					ck.debug("wrong group")
 					break
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		// ask master for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}
@@ -142,14 +144,16 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					return
 				}
 				if ok && (reply.Err == ErrShardNotReady) {
+					ck.debug("not ready")
 					ck.nextSeqNum++
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					ck.debug("wrong group")
 					break
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		// ask master for the latest configuration.
 		ck.config = ck.sm.Query(-1)
 	}

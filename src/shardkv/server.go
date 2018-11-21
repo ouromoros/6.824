@@ -297,9 +297,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.watchLeaderChangeThread()
 	go kv.watchConfigThread()
 	go kv.cleanOldShardThread()
-	if Debug > 0 {
-		go kv.printDebugThread()
-	}
+	// if Debug > 0 {
+	// 	go kv.printDebugThread()
+	// }
 
 	return kv
 }
@@ -497,7 +497,7 @@ func (kv *ShardKV) watchConfigThread() {
 			break
 		}
 		kv.tryUpdateConfig()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -639,7 +639,7 @@ loop:
 			return
 		}
 		kv.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	shard.ConfNum = confNum
@@ -665,7 +665,7 @@ loop:
 			Shard:   shard,
 		})
 		kv.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 	kv.debug("commited shard %v", shardNum)
 }
@@ -793,7 +793,7 @@ func (kv *ShardKV) cleanOldShardThread() {
 		}
 		kv.mu.Unlock()
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
