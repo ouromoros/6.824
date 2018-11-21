@@ -84,6 +84,7 @@ func (ck *Clerk) Get(key string) string {
 	args.Key = key
 	args.ClientID = ck.id
 	args.SeqNum = ck.nextSeqNum
+	args.ConfigNum = ck.config.Num
 
 	for {
 		shard := key2shard(key)
@@ -123,6 +124,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Op = op
 	args.ClientID = ck.id
 	args.SeqNum = ck.nextSeqNum
+	args.ConfigNum = ck.config.Num
 
 	for {
 		shard := key2shard(key)

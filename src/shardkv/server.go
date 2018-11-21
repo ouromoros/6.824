@@ -22,6 +22,13 @@ func (kv *ShardKV) debug(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+func (kv *ShardKV) debug1(format string, a ...interface{}) (n int, err error) {
+	if Debug > 1 {
+		log.Printf(fmt.Sprintf("Server %2d %2d: ", kv.gid, kv.me)+format, a...)
+	}
+	return
+}
+
 func assert(cond bool) {
 	if !cond {
 		panic("assert failed!")
@@ -66,7 +73,6 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	// data map[string]string
 	data          map[int]*Shard
 	currentConfig shardmaster.Config
 	pending       bool
@@ -75,7 +81,6 @@ type ShardKV struct {
 	mck               *shardmaster.Clerk
 	regApplyMap       map[int]regApplyInfo
 	killed            bool
-	wakeWatchConfigCh chan struct{}
 }
 
 type regApplyInfo struct {
@@ -106,7 +111,9 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.debug("started %v", index)
-	kv.tryWakeWatchConfigThread()
+	if args.ConfigNum > kv.currentConfig.Num {
+		kv.tryUpdateConfig()
+	}
 
 	ch := make(chan Err, 1)
 	kv.regApply(index, op, ch)
@@ -119,6 +126,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	case OK:
 		reply.WrongLeader = false
 		shardNum := key2shard(op.Key)
+		// possible race problem, should be passed through channel
 		kv.mu.Lock()
 		reply.Value = kv.data[shardNum].Data[op.Key]
 		kv.mu.Unlock()
@@ -126,6 +134,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.WrongLeader = false
 	case ErrLeaderChange:
 		reply.WrongLeader = true
+	case ErrShardNotReady:
+		reply.WrongLeader = false
 	}
 	reply.Err = err
 }
@@ -147,7 +157,9 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.mu.Unlock()
 		return
 	}
-	kv.tryWakeWatchConfigThread()
+	if args.ConfigNum > kv.currentConfig.Num {
+		kv.tryUpdateConfig()
+	}
 	kv.debug("started %v", index)
 
 	ch := make(chan Err, 1)
@@ -163,6 +175,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.WrongLeader = false
 	case ErrLeaderChange:
 		reply.WrongLeader = true
+	case ErrShardNotReady:
+		reply.WrongLeader = false
 	}
 	reply.Err = err
 }
@@ -283,50 +297,53 @@ func (kv *ShardKV) waitApplyThread() {
 			kv.applyShard(op.Shard)
 			if kv.pending && !kv.shardsAllPresent() {
 				kv.pending = false
+				kv.tryUpdateConfig()
+			}
+			if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+				kv.saveSnapshot(index)
 			}
 			kv.mu.Unlock()
 			continue
 		}
 
+		if prs {
+			if op.ClientID != info.op.ClientID || op.SeqNum != info.op.SeqNum {
+				info.ch <- ErrLeaderChange
+				delete(kv.regApplyMap, ap.CommandIndex)
+			}
+		}
+
 		shard := key2shard(op.Key)
-		if !kv.haveShard(shard) {
+		if kv.currentConfig.Shards[shard] != kv.gid {
 			if prs {
-				if op.ClientID == info.op.ClientID && op.SeqNum == info.op.SeqNum {
-					info.ch <- ErrWrongGroup
-					delete(kv.regApplyMap, ap.CommandIndex)
-				} else {
-					info.ch <- ErrLeaderChange
-					delete(kv.regApplyMap, ap.CommandIndex)
-				}
+				info.ch <- ErrWrongGroup
+				delete(kv.regApplyMap, ap.CommandIndex)
+			}
+			kv.mu.Unlock()
+			continue
+		}
+		if !kv.data[shard].Present {
+			if prs {
+				info.ch <- ErrShardNotReady
+				delete(kv.regApplyMap, ap.CommandIndex)
 			}
 			kv.mu.Unlock()
 			continue
 		}
 
 		// just reject requests when shard not ready
-		go func() {
-			for {
-				kv.mu.Lock()
-				if kv.data[shard].Present {
-					break
-				}
-				kv.mu.Unlock()
-				time.Sleep(100 * time.Millisecond)
+		kv.applyOP(op, shard)
+		if prs {
+			kv.debug("applied %v", index)
+			if op.ClientID == info.op.ClientID && op.SeqNum == info.op.SeqNum {
+				info.ch <- OK
+				delete(kv.regApplyMap, ap.CommandIndex)
+			} else {
+				info.ch <- ErrLeaderChange
+				delete(kv.regApplyMap, ap.CommandIndex)
 			}
-			kv.applyOP(op, shard)
-			if prs {
-				kv.debug("applied %v", index)
-				if op.ClientID == info.op.ClientID && op.SeqNum == info.op.SeqNum {
-					info.ch <- OK
-					delete(kv.regApplyMap, ap.CommandIndex)
-				} else {
-					info.ch <- ErrLeaderChange
-					delete(kv.regApplyMap, ap.CommandIndex)
-				}
-			}
-			kv.mu.Unlock()
-		}()
-		// FIXME should not save snapshot when still pending (unserved requests)
+		}
+
 		if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
 			kv.saveSnapshot(index)
 		}
@@ -351,10 +368,6 @@ func (kv *ShardKV) shardsAllPresent() bool {
 		}
 	}
 	return true
-}
-
-func (kv *ShardKV) haveShard(shardNum int) bool {
-	return kv.currentConfig.Shards[shardNum] == kv.gid
 }
 
 func (kv *ShardKV) saveSnapshot(index int) {
@@ -438,31 +451,19 @@ func (kv *ShardKV) watchConfigThread() {
 		if kv.killed {
 			break
 		}
-
 		kv.mu.Lock()
-		thisConfigNum := kv.currentConfig.Num
-		pending := kv.pending
+		kv.tryUpdateConfig()
 		kv.mu.Unlock()
-
-		if !pending {
-			config := kv.getConfig(thisConfigNum + 1)
-			kv.mu.Lock()
-			if !kv.pending && config.Num == kv.currentConfig.Num+1 {
-				kv.startConfig(config)
-			}
-			kv.mu.Unlock()
-		}
-		select {
-		case <-time.After(100 * time.Millisecond):
-		case <-kv.wakeWatchConfigCh:
-		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func (kv *ShardKV) tryWakeWatchConfigThread() {
-	select{
-	case kv.wakeWatchConfigCh <- struct{}{}:
-	default:
+func (kv *ShardKV) tryUpdateConfig() {
+	if !kv.pending {
+		config := kv.getConfig(kv.currentConfig.Num + 1)
+		if !kv.pending && config.Num == kv.currentConfig.Num+1 {
+			kv.startConfig(config)
+		}
 	}
 }
 
@@ -548,8 +549,9 @@ func (kv *ShardKV) tryRequestShards() {
 			go kv.requestShard(num, confNum)
 		}
 	}
-	if kv.shardsAllPresent() {
+	if kv.pending && kv.shardsAllPresent() {
 		kv.pending = false
+		kv.tryUpdateConfig()
 	}
 }
 
@@ -579,6 +581,7 @@ loop:
 			}
 		}
 		// It's possible the Shard is committed through log
+		kv.debug("requesting Shard %v from %v failed! retrying...", shardNum, config.Shards[shardNum])
 		kv.mu.Lock()
 		if kv.currentConfig.Num != confNum || kv.data[shardNum].Present {
 			kv.mu.Unlock()
@@ -604,7 +607,7 @@ loop:
 			Shard:   shard,
 		})
 		kv.mu.Unlock()
-		time.Sleep(1000 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 	kv.debug("commited shard %v", shardNum)
 }
@@ -659,10 +662,9 @@ func (kv *ShardKV) GetConfigNum(args *GetConfigNumArgs, reply *GetConfigNumReply
 }
 
 // can be further optimized (add the configNum to be compared here)
-func (kv *ShardKV) getConfigNum(servers []string) int {
+func (kv *ShardKV) compareConfigNum(servers []string, num int) bool {
 	var args GetConfigNumArgs
 	ch := make(chan int, len(servers))
-	n := -1
 	for _, s := range servers {
 		srv := kv.make_end(s)
 		var reply GetConfigNumReply
@@ -676,12 +678,12 @@ func (kv *ShardKV) getConfigNum(servers []string) int {
 		}()
 	}
 	for i := 0; i < len(servers); i++ {
-		num := <-ch
-		if num > n {
-			n = num
+		n := <-ch
+		if n > num {
+			return true
 		}
 	}
-	return n
+	return false
 }
 
 func (kv *ShardKV) getConfig(num int) shardmaster.Config {
@@ -703,19 +705,24 @@ func (kv *ShardKV) cleanOldShardThread() {
 			break
 		}
 		kv.mu.Lock()
-		for _, shard := range kv.data {
+		for shardNum, shard := range kv.data {
 			if shard.ConfNum == kv.currentConfig.Num || !shard.Present {
 				continue
 			}
-			s := shard
+			thisConfigNum := shard.ConfNum
+			thisShardNum := shardNum
 			go func() {
-				config := kv.getConfig(s.ConfNum + 1)
-				confNum := kv.getConfigNum(config.Groups[config.Shards[s.ShardNum]])
+				config := kv.getConfig(thisConfigNum + 1)
+				safeToDelete := kv.compareConfigNum(config.Groups[config.Shards[thisShardNum]], thisConfigNum)
 				kv.mu.Lock()
 				defer kv.mu.Unlock()
-				if confNum > s.ConfNum {
-					kv.debug("delete %v", s.ShardNum)
-					delete(kv.data, s.ShardNum)
+				shard, prs := kv.data[thisShardNum]
+				if !prs || shard.ConfNum != thisConfigNum {
+					return
+				}
+				if safeToDelete {
+					kv.debug("delete %v", thisShardNum)
+					delete(kv.data, thisShardNum)
 				}
 			}()
 		}
